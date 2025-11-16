@@ -8,6 +8,21 @@ const nodemailer = require('nodemailer');
 const crypto = require('crypto');
 require('dotenv').config();
 
+// immediately after require('dotenv').config();
+process.on('uncaughtException', err => {
+  console.error("UNCAUGHT EXCEPTION:", err && err.stack ? err.stack : err);
+  // optionally process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, p) => {
+  console.error("UNHANDLED REJECTION at: Promise ", p, " reason: ", reason);
+  // optionally process.exit(1);
+});
+
+
+
+
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -127,27 +142,43 @@ app.get('/api/students', authenticateToken, async (req, res) => {
 
     switch (req.user.role) {
       case 'CA':
-        query = `SELECT s.* FROM students s
-                         WHERE s.class_id = ?`;
+        query = `
+          SELECT s.* 
+          FROM students s
+          WHERE s.class_id = ?
+          ORDER BY s.roll_no ASC
+        `;
         params = [req.user.assigned_class_id];
         break;
 
       case 'Staff':
-        query = `SELECT DISTINCT s.* FROM students s
-                         JOIN subjects sub ON s.class_id = sub.class_id
-                         WHERE sub.staff_id = ?`;
+        query = `
+          SELECT DISTINCT s.* 
+          FROM students s
+          JOIN subjects sub ON s.class_id = sub.class_id
+          WHERE sub.staff_id = ?
+          ORDER BY s.roll_no ASC
+        `;
         params = [req.user.user_id];
         break;
 
       case 'HOD':
-        query = `SELECT s.* FROM students s
-                         JOIN classes c ON s.class_id = c.class_id
-                         WHERE c.dept_id = ?`;
+        query = `
+          SELECT s.* 
+          FROM students s
+          JOIN classes c ON s.class_id = c.class_id
+          WHERE c.dept_id = ?
+          ORDER BY s.roll_no ASC
+        `;
         params = [req.user.dept_id];
         break;
 
-      default: // Principal
-        query = 'SELECT * FROM students';
+      default:
+        query = `
+          SELECT * 
+          FROM students
+          ORDER BY roll_no ASC
+        `;
     }
 
     const [rows] = await pool.query(query, params);
@@ -156,6 +187,22 @@ app.get('/api/students', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Server error while fetching students' });
+  }
+});
+
+app.get("/api/departments/:dept_id/students", authenticateToken, async (req, res) => {
+  try {
+    const { dept_id } = req.params;
+
+    const [rows] = await pool.query(
+      "SELECT * FROM students WHERE dept_id = ? ORDER BY roll_no",
+      [dept_id]
+    );
+
+    res.json(rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Error fetching department students" });
   }
 });
 
@@ -251,7 +298,7 @@ app.post("/api/attendance", authenticateToken, authorize(["Staff", "CA"]), async
       [markedBy]
     );
 
-    const caClasses = allowedRows.filter(r => r.access_type === "ca").map(r => r.class_id);
+    const caClasses = allowedRows.filter(r => r.access_type === "CA").map(r => r.class_id);
 
     if (caClasses.length === 0) {
       return res.status(403).json({ message: "You are not allowed to mark attendance for any class" });
@@ -339,6 +386,147 @@ app.get('/api/classes', authenticateToken, async (req, res) => {
     res.status(500).json({ message: 'Server error', error: err.message });
   }
 });
+
+// Add students
+app.post(
+  "/api/student",
+  authenticateToken,
+  authorize(["Principal", "CA", "HOD", "Staff"]),
+  async (req, res) => {
+    const {
+      name,
+      roll_no,
+      email,
+      mobile,
+      dept_id,
+      class_id,
+      jain,
+      hostel,
+      bus
+    } = req.body;
+
+    if (!name || !roll_no || !email) {
+      return res.status(400).json({ success: false, message: "name, roll_no, and email required" });
+    }
+
+    let conn;
+    try {
+      conn = await pool.getConnection();
+      await conn.beginTransaction();
+
+      const hashed = await bcrypt.hash(roll_no, 10);
+
+      const [userResult] = await conn.execute(
+        `INSERT INTO users (name, email, password, role, dept_id, assigned_class_id)
+         VALUES (?, ?, ?, 'student', ?, ?)`,
+        [name, email, hashed, dept_id, class_id]
+      );
+
+      const [stuResult] = await conn.execute(
+        `INSERT INTO students 
+          (name, roll_no, class_id, dept_id, email, mobile, jain, hostel, bus)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          name,
+          roll_no,
+          class_id,
+          dept_id,
+          email,
+          mobile,
+          jain ? 1 : 0,
+          hostel ? 1 : 0,
+          bus ? 1 : 0
+        ]
+      );
+
+      await conn.commit();
+      return res.json({
+        success: true,
+        message: "Student created successfully",
+        student_id: stuResult.insertId,
+        user_id: userResult.insertId
+      });
+
+    } catch (err) {
+      if (conn) await conn.rollback();
+      console.error("Add student error:", err);
+
+      if (err.code === "ER_DUP_ENTRY") {
+
+        let existing = null;
+
+        const [rollRows] = await conn.execute(
+          "SELECT * FROM students WHERE roll_no = ?",
+          [roll_no]
+        );
+        if (rollRows.length > 0) existing = rollRows[0];
+
+        if (!existing && email) {
+          const [emailRows] = await conn.execute(
+            "SELECT * FROM students WHERE email = ?",
+            [email]
+          );
+          if (emailRows.length > 0) existing = emailRows[0];
+        }
+
+        return res.status(409).json({
+          success: false,
+          code: "DUPLICATE",
+          message: "Duplicate entry",
+          existingStudent: existing
+        });
+      }
+
+
+      return res.status(500).json({ success: false, message: "Server error" });
+    } finally {
+      if (conn) conn.release();
+    }
+  }
+);
+
+
+
+
+// DELETE STUDENT
+app.delete("/api/student/:student_id",
+  authenticateToken,
+  authorize(["Principal", "CA", "HOD"]),
+  async (req, res) => {
+    const { student_id } = req.params;
+
+    let conn;
+    try {
+      conn = await pool.getConnection();
+      await conn.beginTransaction();
+
+      const [rows] = await conn.execute(
+        "SELECT email FROM students WHERE student_id = ?",
+        [student_id]
+      );
+
+      if (!rows.length) {
+        return res.status(404).json({ success: false, message: "Student not found" });
+      }
+
+      const email = rows[0].email;
+
+      await conn.execute("DELETE FROM students WHERE student_id = ?", [student_id]);
+      await conn.execute("DELETE FROM users WHERE email = ? AND role = 'student'", [email]);
+
+      await conn.commit();
+      res.json({ success: true, message: "Student deleted successfully" });
+
+    } catch (err) {
+      if (conn) await conn.rollback();
+      res.status(500).json({ success: false, message: "Server error" });
+    } finally {
+      if (conn) conn.release();
+    }
+  }
+);
+
+
 
 
 // --- Get Students by Class ---
@@ -1078,44 +1266,6 @@ app.get("/api/exams", authenticateToken, async (req, res) => {
 });
 
 // Get fee status
-app.get("/api/fees/:reg_no", authenticateToken, async (req, res) => {
-  const { reg_no } = req.params;
-
-  try {
-    const [rows] = await pool.query(
-      `SELECT 
-         s.student_id,
-         s.name,
-         s.roll_no,
-         s.class_id,
-         s.dept_id,
-         s.email,
-         s.mobile,
-         f.quota,
-         f.total_amount,
-         f.amount_paid,
-         f.balance,
-         f.payment_status,
-         f.remarks,
-         f.created_at,
-         f.updated_at
-       FROM students s
-       LEFT JOIN fees f ON s.roll_no = f.reg_no
-       WHERE s.roll_no = ?`,
-      [reg_no]
-    );
-
-    if (!rows.length) {
-      return res.status(404).json({ message: "No fee record found for this student" });
-    }
-
-    res.json(rows[0]);
-  } catch (err) {
-    console.error("Error fetching fee details:", err);
-    res.status(500).json({ message: "Server error while fetching fee details" });
-  }
-});
-
 
 
 app.get('/api/library/:reg_no', authenticateToken, async (req, res) => {
@@ -1463,7 +1613,6 @@ app.put(
       const { studentId } = req.params;
       const { jain, hostel, bus } = req.body;
 
-      // Validate input
       if (typeof jain === "undefined" && typeof hostel === "undefined" && typeof bus === "undefined") {
         return res.status(400).json({ message: "No valid fields provided" });
       }
@@ -1705,6 +1854,383 @@ app.post("/api/marks", authenticateToken, authorize(["Staff", "CA"]), async (req
   } catch (err) {
     console.error("Error saving marks:", err);
     res.status(500).json({ message: "Server error while saving marks" });
+  }
+});
+
+///////
+//Fees
+///////
+
+app.get(
+  "/api/fees/list",
+  authenticateToken,
+  authorize(["Principal", "HOD", "CA", "Staff"]),
+  async (req, res) => {
+    try {
+      const { dept_id, year, jain, bus, hostel, search } = req.query;
+
+      let conditions = [];
+      let params = [];
+
+      // Filters
+      if (dept_id) {
+        conditions.push("s.dept_id = ?");
+        params.push(dept_id);
+      }
+      if (year) {
+        conditions.push("c.year = ?");
+        params.push(year);
+      }
+      if (jain === "1" || jain === "0") {
+        conditions.push("s.jain = ?");
+        params.push(jain);
+      }
+      if (bus === "1" || bus === "0") {
+        conditions.push("s.bus = ?");
+        params.push(bus);
+      }
+      if (hostel === "1" || hostel === "0") {
+        conditions.push("s.hostel = ?");
+        params.push(hostel);
+      }
+      if (search) {
+        conditions.push("(s.roll_no LIKE ? OR s.name LIKE ?)");
+        params.push(`%${search}%`, `%${search}%`);
+      }
+
+      const whereClause =
+        conditions.length > 0 ? "WHERE " + conditions.join(" AND ") : "";
+
+      const [rows] = await pool.query(
+        `
+        SELECT 
+          s.roll_no AS reg_no,
+          s.name,
+          s.bus,
+          s.hostel,
+
+          -- SEMESTER FEE (SUM of dues)
+          (
+            SELECT SUM(total_amount - amount_paid)
+            FROM fees 
+            WHERE reg_no = s.roll_no AND fee_type = 'SEMESTER'
+          ) AS semester_fee,
+
+          -- HOSTEL FEE
+          (
+            SELECT SUM(total_amount - amount_paid)
+            FROM fees 
+            WHERE reg_no = s.roll_no AND fee_type = 'HOSTEL'
+          ) AS hostel_fee,
+
+          -- TRANSPORT FEE
+          (
+            SELECT SUM(total_amount - amount_paid)
+            FROM fees 
+            WHERE reg_no = s.roll_no AND fee_type = 'TRANSPORT'
+          ) AS transport_fee
+
+        FROM students s
+        LEFT JOIN classes c ON s.class_id = c.class_id
+        ${whereClause}
+        ORDER BY s.roll_no ASC
+        `,
+        params
+      );
+
+      res.json({
+        success: true,
+        count: rows.length,
+        data: rows,
+      });
+    } catch (err) {
+      console.error("Error in fees list:", err);
+      res.status(500).json({ success: false, message: "Server error" });
+    }
+  }
+);
+
+
+
+app.get("/api/fees/student/:reg_no",
+  authenticateToken,
+  authorize(["student", "Principal", "HOD", "CA", "Staff"]),
+  async (req, res) => {
+    const { reg_no } = req.params;
+
+    try {
+      // fees table uses reg_no so this is correct
+      const [fees] = await pool.query(
+        `
+        SELECT 
+          fee_id,
+          fee_type,
+          fee_for,
+          total_amount,
+          amount_paid,
+          (total_amount - amount_paid) AS due,
+          status,
+          created_at
+        FROM fees
+        WHERE reg_no = ?
+        ORDER BY FIELD(fee_type, 'SEMESTER', 'HOSTEL', 'TRANSPORT'), created_at DESC
+        `,
+        [reg_no]
+      );
+
+      // students table stores roll_no (not reg_no) — use roll_no here
+      const [studentRows] = await pool.query(
+        `
+        SELECT name, dept_id, class_id, bus, hostel 
+        FROM students 
+        WHERE roll_no = ?
+        `,
+        [reg_no]
+      );
+
+      // If student entry not found, return 404 (but still return fees array if you prefer)
+      if (!studentRows.length) {
+        return res.status(404).json({ success: false, message: "Student not found" });
+      }
+
+      res.json({
+        success: true,
+        student: studentRows[0],
+        fees
+      });
+
+    } catch (err) {
+      console.error("Error loading student fees:", err && err.stack ? err.stack : err);
+      res.status(500).json({ success: false, message: "Server error" });
+    }
+  });
+
+
+app.post(
+  "/api/fees/add-payment",
+  authenticateToken,
+  authorize(["CA", "HOD", "Principal"]),
+  async (req, res) => {
+    const { reg_no, fee_type, amount } = req.body;
+
+    if (!reg_no || !fee_type || !amount) {
+      return res.status(400).json({ message: "Missing fields" });
+    }
+
+    try {
+      // Find existing fee row
+      const [existing] = await pool.query(
+        `
+        SELECT fee_id, total_amount, amount_paid 
+        FROM fees
+        WHERE reg_no = ? AND fee_type = ?
+        `,
+        [reg_no, fee_type]
+      );
+
+      if (existing.length === 0)
+        return res.status(404).json({ message: "Fee record not found" });
+
+      const fee = existing[0];
+      const newPaid = Number(fee.amount_paid) + Number(amount);
+      const newStatus =
+        newPaid >= fee.total_amount
+          ? "PAID"
+          : newPaid > 0
+            ? "PARTIAL"
+            : "NOT PAID";
+
+      // Update DB
+      await pool.query(
+        `
+        UPDATE fees
+        SET amount_paid = ?, status = ?, updated_at = NOW()
+        WHERE fee_id = ?
+        `,
+        [newPaid, newStatus, fee.fee_id]
+      );
+
+      res.json({
+        success: true,
+        message: "Payment added successfully",
+        paid: newPaid,
+        status: newStatus,
+      });
+    } catch (err) {
+      console.error("Payment Add Error:", err);
+      res.status(500).json({ message: "Server error" });
+    }
+  }
+);
+
+
+
+app.get(
+  "/api/fees/analytics",
+  authenticateToken,
+  authorize(["Principal", "HOD", "CA", "Staff"]),
+  async (req, res) => {
+    try {
+      const { dept_id, year, jain, hostel, bus } = req.query;
+
+      let conditions = [];
+      let params = [];
+
+      // Dynamic filters
+      if (dept_id) {
+        conditions.push("s.dept_id = ?");
+        params.push(dept_id);
+      }
+      if (year) {
+        conditions.push("c.year = ?");
+        params.push(year);
+      }
+      if (jain === "1" || jain === "0") {
+        conditions.push("s.jain = ?");
+        params.push(jain);
+      }
+      if (hostel === "1" || hostel === "0") {
+        conditions.push("s.hostel = ?");
+        params.push(hostel);
+      }
+      if (bus === "1" || bus === "0") {
+        conditions.push("s.bus = ?");
+        params.push(bus);
+      }
+
+      const whereClause =
+        conditions.length ? "WHERE " + conditions.join(" AND ") : "";
+
+      // ==========================
+      // 1) TOTAL STUDENTS
+      // ==========================
+      const [studentCountRows] = await pool.query(
+        `
+        SELECT COUNT(*) AS total 
+        FROM students s
+        LEFT JOIN classes c ON s.class_id = c.class_id
+        ${whereClause}
+        `,
+        params
+      );
+
+      const total_students = studentCountRows[0]?.total || 0;
+
+      // ==========================
+      // 2) PAYMENT STATUS COUNTS
+      // ==========================
+      const [statusRows] = await pool.query(
+        `
+        SELECT 
+          SUM(f.status = 'PAID') AS paid,
+          SUM(f.status = 'PARTIAL') AS partial,
+          SUM(f.status = 'NOT PAID') AS unpaid
+        FROM students s
+        LEFT JOIN classes c ON s.class_id = c.class_id
+        LEFT JOIN fees f ON s.roll_no = f.reg_no
+        ${whereClause}
+        `,
+        params
+      );
+
+      const paid = statusRows[0]?.paid || 0;
+      const partial = statusRows[0]?.partial || 0;
+      const unpaid = statusRows[0]?.unpaid || 0;
+
+      // ==========================
+      // 3) COLLECTION TOTALS
+      // ==========================
+      const [collectionRows] = await pool.query(
+        `
+        SELECT
+          SUM(f.amount_paid) AS collected,
+          SUM(f.total_amount - f.amount_paid) AS pending
+        FROM students s
+        LEFT JOIN classes c ON s.class_id = c.class_id
+        LEFT JOIN fees f ON s.roll_no = f.reg_no
+        ${whereClause}
+        `,
+        params
+      );
+
+      const total_collected = collectionRows[0]?.collected || 0;
+      const total_pending = collectionRows[0]?.pending || 0;
+
+      // ==========================
+      // 4) DUES PER FEE TYPE
+      // ==========================
+      const [duesRows] = await pool.query(
+        `
+        SELECT 
+          SUM(CASE WHEN f.fee_type = 'SEMESTER' THEN (f.total_amount - f.amount_paid) END) AS semester_dues,
+          SUM(CASE WHEN f.fee_type = 'HOSTEL' THEN (f.total_amount - f.amount_paid) END) AS hostel_dues,
+          SUM(CASE WHEN f.fee_type = 'TRANSPORT' THEN (f.total_amount - f.amount_paid) END) AS transport_dues
+        FROM students s
+        LEFT JOIN classes c ON s.class_id = c.class_id
+        LEFT JOIN fees f ON s.roll_no = f.reg_no
+        ${whereClause}
+        `,
+        params
+      );
+
+      res.json({
+        success: true,
+        data: {
+          total_students,
+          paid,
+          partial,
+          unpaid,
+          total_collected,
+          total_pending,
+          semester_dues: duesRows[0]?.semester_dues || 0,
+          hostel_dues: duesRows[0]?.hostel_dues || 0,
+          transport_dues: duesRows[0]?.transport_dues || 0,
+        },
+      });
+    } catch (err) {
+      console.error("❌ Error in /api/fees/analytics:", err);
+      res.status(500).json({ success: false, message: "Server error" });
+    }
+  }
+);
+
+app.get("/api/fees/:reg_no", authenticateToken, async (req, res) => {
+  const { reg_no } = req.params;
+
+  try {
+    const [rows] = await pool.query(
+      `
+      SELECT 
+         s.student_id,
+         s.name,
+         s.roll_no,
+         s.class_id,
+         s.dept_id,
+         s.email,
+         s.mobile,
+         f.quota,
+         f.total_amount,
+         f.amount_paid,
+         f.balance,
+         f.status,       
+         f.remarks,
+         f.created_at,
+         f.updated_at
+       FROM students s
+       LEFT JOIN fees f ON s.roll_no = f.reg_no
+       WHERE s.roll_no = ?
+      `,
+      [reg_no]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ message: "No fee record found for this student" });
+    }
+
+    res.json(rows[0]);
+  } catch (err) {
+    console.error("Error fetching fee details:", err);
+    res.status(500).json({ message: "Server error while fetching fee details" });
   }
 });
 
