@@ -1,36 +1,23 @@
-// routes/auth.js
+// const jwt = require("jsonwebtoken");
 
-const express = require('express');
+// module.exports = function auth(req, res, next) {
+//   const token = req.headers.authorization?.split(" ")[1];
 
-module.exports = (db) => {
-    const router = express.Router();
+//   if (!token) {
+//     return res.status(401).json({ message: "No token" });
+//   }
 
-    // Hardcoded User Data (Replace with DB check in production)
-    const users = {
-        'principal_mnmjec': { id: 1, name: 'Principal', role: 'Admin' },
-        'staff_mnmjec': { id: 2, name: 'Faculty Staff', role: 'Staff', dept: 'CSE' },
-        'hod_mnmjec': { id: 3, name: 'HOD', role: 'HOD', dept: 'CSE' },
-    };
+//   try {
+//     const decoded = jwt.verify(token, process.env.JWT_SECRET);
 
-    router.post('/login', (req, res) => {
-        const { username, password } = req.body;
-        
-        if (password !== 'Test@123') {
-            return res.status(401).json({ message: 'Invalid credentials' });
-        }
+//     // Your session expiry check
+//     if (decoded.sessionExpiry && Date.now() > decoded.sessionExpiry) {
+//       return res.status(440).json({ message: "Session expired" });
+//     }
 
-        const user = users[username.toLowerCase()];
-        
-        if (user) {
-            // In a real app, generate and return a JWT here
-            return res.json({ 
-                message: 'Login successful', 
-                user: { id: user.id, name: user.name, role: user.role, dept: user.dept }
-            });
-        }
-
-        res.status(401).json({ message: 'Invalid credentials' });
-    });
-
-    return router;
-};
+//     req.user = decoded;
+//     next();
+//   } catch (err) {
+//     return res.status(401).json({ message: "Invalid token" });
+//   }
+// };

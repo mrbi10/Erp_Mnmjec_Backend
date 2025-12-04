@@ -16,6 +16,5 @@ const pool = mysql.createPool({
 // Use .promise() to allow async/await usage
 const promisePool = pool.promise();
 
-console.log(`MySQL database connected to ${process.env.DB_NAME}`);
 
 module.exports = promisePool;

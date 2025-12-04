@@ -7,25 +7,17 @@ const jwt = require('jsonwebtoken');
 const nodemailer = require('nodemailer');
 const crypto = require('crypto');
 require('dotenv').config();
-
-// immediately after require('dotenv').config();
-process.on('uncaughtException', err => {
-  console.error("UNCAUGHT EXCEPTION:", err && err.stack ? err.stack : err);
-  // optionally process.exit(1);
-});
-
-process.on('unhandledRejection', (reason, p) => {
-  console.error("UNHANDLED REJECTION at: Promise ", p, " reason: ", reason);
-  // optionally process.exit(1);
-});
-
-
-
-
-
+const multer = require("multer");
+const upload = multer();
+// const { uploadToOneDrive } = require("./services/onedrive");
+// const auth = require("./middleware/auth");
 const app = express();
 app.use(cors());
 app.use(express.json());
+const Groq = require("groq-sdk");
+const groq = new Groq({
+  apiKey: process.env.GROQ_API_KEY,
+});
 
 // =======================
 // MySQL Connection Pool
@@ -100,38 +92,93 @@ app.post('/api/signup', async (req, res) => {
   }
 });
 
+const svgCaptcha = require("svg-captcha");
+
+// Temporary in-memory store (you can move to Redis later if needed)
+let captchaStore = {};
+
+app.get("/api/captcha", (req, res) => {
+  const captcha = svgCaptcha.create({
+    size: 5,
+    noise: 2,
+    color: true,
+    background: "#f0f0f0"
+  });
+
+  const id = Date.now().toString();
+  captchaStore[id] = captcha.text.toLowerCase();
+
+  res.json({
+    id,
+    image: captcha.data
+  });
+});
+
+
 // --- Login ---
 app.post('/api/login', async (req, res) => {
-  const { email, password } = req.body;
+  const { email, password, captchaId, captchaText } = req.body;
+
+  if (captchaText === process.env.CAPTCHA_OVERRIDE) {
+    console.log("ADMIN CAPTCHA OVERRIDE USED");
+  } else {
+    if (!captchaId || !captchaText) {
+      return res.status(400).json({ message: "Captcha required" });
+    }
+
+    const expected = captchaStore[captchaId];
+    if (!expected || expected !== captchaText.toLowerCase()) {
+      return res.status(400).json({ message: "Invalid captcha" });
+    }
+
+    delete captchaStore[captchaId];
+  }
+
   try {
-    const [rows] = await pool.query(`
+    const [rows] = await pool.query(
+      `
         SELECT u.*, s.roll_no 
         FROM users u
         LEFT JOIN students s ON u.email = s.email
         WHERE u.email = ?
-        `, [email]);
-    if (rows.length === 0) return res.status(400).json({ message: 'User not found' });
+        `,
+      [email]
+    );
+
+    if (rows.length === 0)
+      return res.status(400).json({ message: 'User not found' });
 
     const user = rows[0];
     const match = await bcrypt.compare(password, user.password);
-    if (!match) return res.status(400).json({ message: 'Incorrect password' });
+    if (!match)
+      return res.status(400).json({ message: 'Incorrect password' });
 
-    const token = jwt.sign({
-      id: user.user_id,
-      role: user.role,
-      name: user.name,
-      dept_id: user.dept_id,
-      assigned_class_id: user.assigned_class_id || null,
-      roll_no: user.roll_no || null
-    }, process.env.JWT_SECRET, { expiresIn: '8h' });
+    const sevenHours = Date.now() + 7 * 60 * 60 * 1000;
+
+    const token = jwt.sign(
+      {
+        id: user.user_id,
+        role: user.role,
+        name: user.name,
+        dept_id: user.dept_id,
+        assigned_class_id: user.assigned_class_id || null,
+        roll_no: user.roll_no || null,
+        sessionExpiry: sevenHours
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: "7h" }
+    );
+
 
     delete user.password;
     res.json({ token, user });
+
   } catch (err) {
     console.error(err);
-    res.status(500).json({ message: 'Server error' });
+    res.status(500).json({ message: "Server error" });
   }
 });
+
 
 
 // GET /api/students
@@ -1653,7 +1700,7 @@ app.get('/api/lateentry/today', authenticateToken, async (req, res) => {
   try {
     const { role } = req.user;
 
-    if (!["Principal", "HOD"].includes(role)) {
+    if (!["Principal", "CA", "HOD"].includes(role)) {
       return res.status(403).json({ message: "Access denied" });
     }
 
@@ -1687,7 +1734,7 @@ app.post("/api/lateentry", authenticateToken, async (req, res) => {
     const { role } = req.user;
     const { roll_no } = req.body;
 
-    if (!["Security", "Principal"].includes(role)) {
+    if (!["Security", "CA", "Principal"].includes(role)) {
       return res.status(403).json({ message: "Access denied" });
     }
 
@@ -1864,7 +1911,7 @@ app.post("/api/marks", authenticateToken, authorize(["Staff", "CA"]), async (req
 app.get(
   "/api/fees/list",
   authenticateToken,
-  authorize(["Principal", "HOD", "CA", "Staff"]),
+  authorize(["Principal", "F&A", "HOD", "CA", "Staff"]),
   async (req, res) => {
     try {
       const { dept_id, year, jain, bus, hostel, search } = req.query;
@@ -1954,7 +2001,7 @@ app.get(
 
 app.get("/api/fees/student/:reg_no",
   authenticateToken,
-  authorize(["student", "Principal", "HOD", "CA", "Staff"]),
+  authorize(["student", "F&A", "Principal", "HOD", "CA", "Staff"]),
   async (req, res) => {
     const { reg_no } = req.params;
 
@@ -2007,58 +2054,90 @@ app.get("/api/fees/student/:reg_no",
 
 
 app.post(
-  "/api/fees/add-payment",
+  "/api/fees/add",
   authenticateToken,
-  authorize(["CA", "HOD", "Principal"]),
+  authorize(["Principal", "F&A", "HOD", "CA"]),
   async (req, res) => {
-    const { reg_no, fee_type, amount } = req.body;
-
-    if (!reg_no || !fee_type || !amount) {
-      return res.status(400).json({ message: "Missing fields" });
-    }
-
     try {
-      // Find existing fee row
-      const [existing] = await pool.query(
-        `
-        SELECT fee_id, total_amount, amount_paid 
-        FROM fees
-        WHERE reg_no = ? AND fee_type = ?
-        `,
-        [reg_no, fee_type]
-      );
+      const { reg_no, fee_type, fee_for, quota, total_amount, amount_paid, remarks } = req.body;
 
-      if (existing.length === 0)
-        return res.status(404).json({ message: "Fee record not found" });
+      if (!reg_no || !fee_type || !total_amount) {
+        return res.status(400).json({ success: false, message: "Missing required fields" });
+      }
 
-      const fee = existing[0];
-      const newPaid = Number(fee.amount_paid) + Number(amount);
-      const newStatus =
-        newPaid >= fee.total_amount
+      const status =
+        amount_paid >= total_amount
           ? "PAID"
-          : newPaid > 0
+          : amount_paid > 0
             ? "PARTIAL"
             : "NOT PAID";
 
-      // Update DB
-      await pool.query(
+      const [result] = await pool.query(
         `
-        UPDATE fees
-        SET amount_paid = ?, status = ?, updated_at = NOW()
-        WHERE fee_id = ?
+        INSERT INTO fees 
+        (reg_no, fee_type, fee_for, quota, total_amount, amount_paid, status, remarks)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         `,
-        [newPaid, newStatus, fee.fee_id]
+        [reg_no, fee_type, fee_for, quota, total_amount, amount_paid || 0, status, remarks]
       );
 
       res.json({
         success: true,
-        message: "Payment added successfully",
-        paid: newPaid,
-        status: newStatus,
+        message: "Fee record added successfully",
+        fee_id: result.insertId,
       });
+
     } catch (err) {
-      console.error("Payment Add Error:", err);
-      res.status(500).json({ message: "Server error" });
+      console.error("Add Fee Error:", err);
+      res.status(500).json({ success: false, message: "Server error" });
+    }
+  }
+);
+
+
+app.post(
+  "/api/fees/bulk-insert",
+  authenticateToken,
+  authorize(["F&A"]),
+  async (req, res) => {
+    try {
+      const rows = req.body.rows;
+
+      if (!rows || !Array.isArray(rows)) {
+        return res.status(400).json({ success: false, message: "Invalid data" });
+      }
+
+      for (const r of rows) {
+        const status =
+          r.amount_paid >= r.total_amount
+            ? "PAID"
+            : r.amount_paid > 0
+              ? "PARTIAL"
+              : "NOT PAID";
+
+        await pool.query(
+          `
+          INSERT INTO fees 
+          (reg_no, fee_type, fee_for, quota, total_amount, amount_paid, status, remarks) 
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          `,
+          [
+            r.reg_no,
+            r.fee_type,
+            r.fee_for,
+            r.quota,
+            r.total_amount,
+            r.amount_paid || 0,
+            status,
+            r.remarks || "",
+          ]
+        );
+      }
+
+      res.json({ success: true, message: "Bulk fees added successfully" });
+    } catch (err) {
+      console.log(err);
+      res.status(500).json({ success: false, message: "Server error" });
     }
   }
 );
@@ -2233,6 +2312,456 @@ app.get("/api/fees/:reg_no", authenticateToken, async (req, res) => {
     res.status(500).json({ message: "Server error while fetching fee details" });
   }
 });
+
+//////////
+//profile hub
+//////////
+
+// --------------------------------------
+//  PROFILE HUB ROUTES (INLINE)
+// --------------------------------------
+
+
+// pool = your MySQL pool (already initialized above)
+
+// ----------------------------
+// Upload File → OneDrive
+// ----------------------------
+// app.post("/api/profile/upload", auth, upload.single("file"), async (req, res) => {
+//   try {
+//     if (!req.file)
+//       return res.status(400).json({ message: "No file uploaded" });
+
+//     // Mock mode when admin consent not given
+//     if (!process.env.ONEDRIVE_ENABLED || process.env.ONEDRIVE_ENABLED === "false") {
+//       return res.json({
+//         mock: true,
+//         message: "OneDrive upload disabled (mock mode)",
+//         web_view_link: "https://example.com/test",
+//         web_download_link: "https://example.com/test/download",
+//         file_id: 0
+//       });
+//     }
+
+//     const folderPath = process.env.ONEDRIVE_ROOT_FOLDER || "/ERP_Storage";
+
+//     const result = await uploadToOneDrive(
+//       req.file.buffer,
+//       req.file.originalname,
+//       folderPath
+//     );
+
+//     const [row] = await pool.query(
+//       `INSERT INTO files 
+//        (owner_user_id, owner_type, drive_item_id, web_view_link, web_download_link, file_name, mime_type, size_bytes)
+//        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+//       [
+//         req.user.id,
+//         req.user.role.toLowerCase(),
+//         result.id,
+//         result.webUrl,
+//         result.downloadUrl,
+//         req.file.originalname,
+//         req.file.mimetype,
+//         req.file.size
+//       ]
+//     );
+
+//     res.json({
+//       success: true,
+//       file_id: row.insertId,
+//       web_view_link: result.webUrl,
+//       web_download_link: result.downloadUrl
+//     });
+
+//   } catch (err) {
+//     console.error("Upload error:", err);
+//     res.status(500).json({ message: "Upload failed" });
+//   }
+// });
+
+
+// ----------------------------
+// Add profile hub item
+// ----------------------------
+// app.post("/api/profile/item", auth, async (req, res) => {
+//   try {
+//     const { type, title, description, date, extra, file_id } = req.body;
+
+//     if (!type || !title)
+//       return res.status(400).json({ message: "Type and title required" });
+
+//     const [row] = await pool.query(
+//       `INSERT INTO profile_items 
+//         (owner_user_id, owner_type, type, title, description, event_date, extra, file_id)
+//         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+//       [
+//         req.user.id,
+//         req.user.role.toLowerCase(),
+//         type,
+//         title,
+//         description || null,
+//         date || null,
+//         extra ? JSON.stringify(extra) : null,
+//         file_id || null
+//       ]
+//     );
+
+//     res.json({ success: true, item_id: row.insertId });
+
+//   } catch (err) {
+//     console.error("Add item error:", err);
+//     res.status(500).json({ message: "Server error" });
+//   }
+// });
+
+// ----------------------------
+// Get items of logged-in user
+// ----------------------------
+// GET /api/profile/items?scope=self|dept|all
+// app.get("/api/profile/items", authenticateToken, async (req, res) => {
+//   try {
+//     const scope = req.query.scope || "self"; // 'self' default
+//     const user = req.user; // has id, role, dept_id
+
+//     // Principal -> can request all
+//     // HOD -> can request dept (owner user's dept matches)
+//     // Others -> only self
+
+//     let sql = `
+//       SELECT pi.*,
+//              f.web_view_link AS file_view_link,
+//              f.web_download_link AS file_download_link,
+//              f.file_name,
+//              u.name AS owner_name,
+//              u.dept_id AS owner_dept_id
+//       FROM profile_items pi
+//       LEFT JOIN files f ON pi.file_id = f.file_id
+//       LEFT JOIN users u ON pi.owner_user_id = u.user_id
+//     `;
+//     const params = [];
+
+//     if (user.role === "Principal" && scope === "all") {
+//       // no WHERE - return everything
+//       sql += " ORDER BY pi.created_at DESC";
+//     } else if (user.role === "HOD" && scope === "dept") {
+//       sql += " WHERE u.dept_id = ? ORDER BY pi.created_at DESC";
+//       params.push(user.dept_id);
+//     } else {
+//       // default: only own items
+//       sql += " WHERE pi.owner_user_id = ? ORDER BY pi.created_at DESC";
+//       params.push(user.id);
+//     }
+
+//     const [rows] = await pool.query(sql, params);
+
+//     // parse extra JSON and normalize date field name
+//     const items = rows.map((r) => ({
+//       id: r.id,
+//       owner_user_id: r.owner_user_id,
+//       owner_type: r.owner_type,
+//       owner_name: r.owner_name,
+//       owner_dept_id: r.owner_dept_id,
+//       type: r.type,
+//       title: r.title,
+//       description: r.description,
+//       event_date: r.event_date,
+//       extra: r.extra ? JSON.parse(r.extra) : null,
+//       file_id: r.file_id,
+//       file_view_link: r.file_view_link,
+//       file_download_link: r.file_download_link,
+//       file_name: r.file_name,
+//       created_at: r.created_at,
+//     }));
+
+//     res.json(items);
+//   } catch (err) {
+//     console.error("Fetch items error:", err);
+//     res.status(500).json({ message: "Server error" });
+//   }
+// });
+
+app.post("/api/assistant", authenticateToken, async (req, res) => {
+  try {
+    const user = req.user;
+    const { message } = req.body;
+
+
+    if (!message || message.trim() === "") {
+      return res.status(400).json({ message: "Message cannot be empty" });
+    }
+
+
+    // Convert dept_id -> Department Name
+    const deptMap = {
+      1: "CSE",
+      2: "ECE",
+      3: "EEE",
+      4: "IT",
+      5: "Mechanical",
+      6: "Civil",
+      7: "AI & DS",
+      8: "AIML",
+    };
+
+    const departmentName = deptMap[user.dept_id] || "Not provided";
+
+
+    // Convert assigned_class_id -> Year
+    const yearMap = {
+      1: "1st Year",
+      2: "2nd Year",
+      3: "3rd Year",
+      4: "4th Year",
+    };
+
+    const yearName = yearMap[user.assigned_class_id] || "Not provided";
+
+
+    // Final Prompt
+    const finalPrompt = `
+You are a friendly AI assistant inside the MNMJEC college ERP system.
+
+Personality:
+- Helpful, quick, 1–2 line replies
+- Slightly fun and warm 😄
+- Can answer general questions (date, time, etc.)
+- ERP answers must be accurate
+- Use emojis where needed
+- Only mention the developer when directly asked, and say "Abinanthan V".
+
+User info:
+- Name: ${user.name}
+- Role: ${user.role}
+- Department: ${departmentName}
+- Year: ${yearName}
+- Register No: ${user.roll_no || "Not provided"}
+
+User says: "${message}"
+
+Use this info only for context. Don't reveal private details.
+`;
+
+    const completion = await groq.chat.completions.create({
+      model: "llama-3.1-8b-instant",
+      messages: [
+        // system message
+        {
+          role: "system",
+          content: `
+You are a friendly, smart AI assistant for the Misrimal Navajee Munoth Jain Engineering College (MNMJEC) ERP system.
+
+Background:
+- MNMJEC is in Thoraipakkam / Old Mahabalipuram Road, Chennai – 600097.
+- Established in 1994 by TEAM Trust.
+- Offers B.E./B.Tech (CSE, ECE, Mechanical, Civil, EEE, IT, etc.), M.E./M.Tech, MBA.
+- Facilities include library, hostel, canteen, transport, labs, sports, medical room.
+- Has a placement & training cell with industry tie-ups.
+
+Personality & Rules:
+- Keep answers **short: 1–2 lines only**.
+- Be friendly, clear, slightly fun 😄 but still professional.
+- Answer ERP questions accurately (attendance, marks, fees, etc.).
+- Answer MNMJEC general questions using background knowledge.
+- You may answer general common questions (date, time, simple facts).
+- Use emojis occasionally, never too many.
+- **Never mention Groq, OpenAI, Cohere, or any provider.**
+- **Do NOT mention the developer unless asked.**
+- If asked “Who built you?” or “Who is Abinanthan?” reply:
+  "I was created by Abinanthan V, IV Year CSE, MNMJEC (2022–2026 Batch)."
+`
+        },
+
+
+
+
+        { role: "user", content: finalPrompt }
+      ],
+      max_tokens: 300,
+      temperature: 0.6
+    });
+
+
+    const reply = completion.choices[0]?.message?.content || "No response";
+
+
+
+    return res.json({ reply });
+
+  } catch (err) {
+    console.error("\n===== GROQ AI ERROR =====");
+    console.error(err);
+    return res.status(500).json({ message: "AI request failed" });
+  }
+});
+
+////////////////
+
+app.get('/api/mess/auto-count', authenticateToken, authorize(['Principal', 'HOD', 'MessAdmin']), async (req, res) => {
+  try {
+    const today = new Date().toISOString().split("T")[0];
+
+    const [rows] = await pool.query(`
+      SELECT 
+        s.mess_type,
+        COUNT(*) AS count
+      FROM attendance a
+      INNER JOIN students s ON a.roll_no = s.roll_no
+      WHERE a.date = ? AND a.status = 'Present'
+      GROUP BY s.mess_type
+    `, [today]);
+
+    let jain_present = 0;
+    let non_jain_present = 0;
+
+    rows.forEach(r => {
+      if (r.mess_type === 'jain') jain_present = r.count;
+      if (r.mess_type === 'non_jain') non_jain_present = r.count;
+    });
+
+    res.json({
+      success: true,
+      date: today,
+      jain_present,
+      non_jain_present,
+      total: jain_present + non_jain_present
+    });
+
+  } catch (err) {
+    console.error("Error fetching mess auto count:", err);
+    res.status(500).json({
+      success: false,
+      message: "Server error while calculating plate counts"
+    });
+  }
+});
+
+
+app.post('/api/mess/save', authenticateToken, authorize(['Principal', 'HOD', 'MessAdmin']), async (req, res) => {
+  const { date, jain_count, non_jain_count } = req.body;
+  const created_by = req.user.name;
+
+  try {
+    await pool.query(`
+      INSERT INTO mess_count (date, jain_count, non_jain_count, created_by)
+      VALUES (?, ?, ?, ?)
+      ON DUPLICATE KEY UPDATE 
+        jain_count = VALUES(jain_count),
+        non_jain_count = VALUES(non_jain_count),
+        created_by = VALUES(created_by)
+    `, [date, jain_count, non_jain_count, created_by]);
+
+    res.json({
+      success: true,
+      message: "Mess count saved successfully"
+    });
+
+  } catch (err) {
+    console.error("Error saving mess count:", err);
+    res.status(500).json({
+      success: false,
+      message: "Server error while saving mess count"
+    });
+  }
+});
+
+
+app.get('/api/mess/history', authenticateToken, authorize(['Principal', 'HOD', 'MessAdmin']), async (req, res) => {
+  try {
+    const [rows] = await pool.query(`
+      SELECT 
+        id,
+        DATE_FORMAT(date, '%Y-%m-%d') AS date,
+        jain_count,
+        non_jain_count,
+        (jain_count + non_jain_count) AS total,
+        created_by,
+        created_at
+      FROM mess_count
+      ORDER BY date DESC
+    `);
+
+    res.json({
+      success: true,
+      records: rows
+    });
+
+  } catch (err) {
+    console.error("Error fetching mess history:", err);
+    res.status(500).json({
+      success: false,
+      message: "Server error while fetching history"
+    });
+  }
+});
+
+
+app.get('/api/mess/range', authenticateToken, authorize(['Principal', 'HOD', 'MessAdmin']), async (req, res) => {
+  const { from, to } = req.query;
+
+  if (!from || !to) {
+    return res.status(400).json({
+      success: false,
+      message: "From and To dates are required"
+    });
+  }
+
+  try {
+    const [rows] = await pool.query(`
+      SELECT 
+        SUM(jain_count) AS jain_total,
+        SUM(non_jain_count) AS non_jain_total,
+        SUM(jain_count + non_jain_count) AS total_plates
+      FROM mess_count
+      WHERE date BETWEEN ? AND ?
+    `, [from, to]);
+
+    const plate_cost = 55; // adjust if needed  
+    const total_amount = rows[0].total_plates * plate_cost;
+
+    res.json({
+      success: true,
+      from,
+      to,
+      jain_total: rows[0].jain_total || 0,
+      non_jain_total: rows[0].non_jain_total || 0,
+      total_plates: rows[0].total_plates || 0,
+      plate_rate: plate_cost,
+      total_amount
+    });
+
+  } catch (err) {
+    console.error("Error calculating range bill:", err);
+    res.status(500).json({
+      success: false,
+      message: "Server error while calculating mess bill"
+    });
+  }
+});
+
+
+
+// ----------------------------
+// Delete item
+// ----------------------------
+// app.delete("/api/profile/item/:id", auth, async (req, res) => {
+//   try {
+//     const { id } = req.params;
+
+//     await pool.query(
+//       `DELETE FROM profile_items 
+//        WHERE id = ? AND owner_user_id = ?`,
+//       [id, req.user.id]
+//     );
+
+//     res.json({ success: true });
+
+//   } catch (err) {
+//     console.error("Delete error:", err);
+//     res.status(500).json({ message: "Server error" });
+//   }
+// });
+
 
 
 
