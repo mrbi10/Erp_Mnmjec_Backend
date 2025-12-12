@@ -1369,15 +1369,10 @@ app.get('/api/assignments/:reg_no', authenticateToken, async (req, res) => {
 app.get("/api/announcements", authenticateToken, async (req, res) => {
   try {
     const user = req.user;
-
-    if (!user) {
-      return res.status(403).json({ message: "Access denied" });
-    }
-
     let dept_id = null;
     let class_id = null;
 
-    // --- Student: get dept + class
+    // STUDENT → get dept + class
     if (user.role === "student") {
       const [rows] = await pool.query(
         `SELECT dept_id, class_id FROM students WHERE roll_no = ?`,
@@ -1389,7 +1384,7 @@ app.get("/api/announcements", authenticateToken, async (req, res) => {
       class_id = rows[0].class_id;
     }
 
-    // --- Staff / CA / HOD: get dept only
+    // STAFF / CA / HOD → get dept + assigned class if CA
     else {
       const [rows] = await pool.query(
         `SELECT dept_id, assigned_class_id FROM users WHERE user_id = ?`,
@@ -1398,78 +1393,82 @@ app.get("/api/announcements", authenticateToken, async (req, res) => {
       if (!rows.length) return res.status(404).json({ message: "User not found" });
 
       dept_id = rows[0].dept_id;
-      class_id = rows[0].assigned_class_id || null;
+      class_id = rows[0].assigned_class_id;
     }
 
-    // --- Base query
+    // BASE QUERY with JOIN to fetch creator names
     let query = `
-      SELECT id, title, message, target_type, target_id, created_at, created_by
-      FROM announcements
-      WHERE target_type = 'all'
+      SELECT 
+        a.id, a.title, a.message, a.target_type, a.target_id,
+        a.created_at, a.created_by,
+        u.name AS created_by_name
+      FROM announcements a
+      LEFT JOIN users u ON u.user_id = a.created_by
+      WHERE a.target_type = 'all'
     `;
+
     const params = [];
 
-    // -----------------------------
-    // Role-based filtering
-    // -----------------------------
-
-    // STUDENT
+    // STUDENT visibility
     if (user.role === "student") {
       query += `
-        OR (target_type = 'department' AND target_id = ?)
-        OR (target_type = 'class' AND target_id = ?)
+        OR (a.target_type = 'department' AND a.target_id = ?)
+        OR (a.target_type = 'class' AND a.target_id = ?)
       `;
       params.push(dept_id, class_id);
     }
 
-    // CA
+    // CA visibility
     else if (user.role === "CA") {
       query += `
-        OR (target_type = 'department' AND target_id = ?)
-        OR (target_type = 'class' AND target_id = ?)
+        OR (a.target_type = 'department' AND a.target_id = ?)
+        OR (a.target_type = 'class' AND a.target_id = ?)
       `;
       params.push(dept_id, class_id);
     }
 
-    // HOD
+    // STAFF visibility
+    else if (user.role === "staff") {
+      query += `
+        OR (a.target_type = 'department' AND a.target_id = ?)
+      `;
+      params.push(dept_id);
+    }
+
+    // HOD visibility — all classes in their dept
     else if (user.role === "HOD") {
       query += `
-        OR (target_type = 'department' AND target_id = ?)
-        OR (target_type = 'class' AND target_id IN (
-          SELECT class_id FROM classes WHERE dept_id = ?
+        OR (a.target_type = 'department' AND a.target_id = ?)
+        OR (a.target_type = 'class' AND a.target_id IN (
+            SELECT class_id FROM classes WHERE dept_id = ?
         ))
       `;
       params.push(dept_id, dept_id);
     }
 
-    // STAFF
-    else if (user.role === "staff") {
-      query += `
-        OR (target_type = 'department' AND target_id = ?)
-      `;
-      params.push(dept_id);
-    }
-
     // PRINCIPAL sees everything
     else if (user.role === "Principal") {
       query = `
-        SELECT id, title, message, target_type, target_id, created_at, created_by
-        FROM announcements
+        SELECT 
+          a.id, a.title, a.message, a.target_type, a.target_id,
+          a.created_at, a.created_by,
+          u.name AS created_by_name
+        FROM announcements a
+        LEFT JOIN users u ON u.user_id = a.created_by
       `;
     }
 
-    // Sort
-    query += ` ORDER BY created_at DESC`;
+    query += ` ORDER BY a.created_at DESC`;
 
-    const [announcements] = await pool.query(query, params);
-
-    res.json(announcements);
+    const [rows] = await pool.query(query, params);
+    res.json(rows);
 
   } catch (err) {
-    console.error("❌ Error fetching announcements:", err);
+    console.error("❌ GET announcements error:", err);
     res.status(500).json({ message: "Server error" });
   }
 });
+
 
 
 app.post("/api/announcements", authenticateToken, async (req, res) => {
@@ -1477,80 +1476,142 @@ app.post("/api/announcements", authenticateToken, async (req, res) => {
     const user = req.user;
     const { title, message, target_type, target_id } = req.body;
 
-    // only CA, HOD, PRINCIPAL, STAFF can post
-    if (!["CA", "HOD", "Principal", "staff"].includes(user.role)) {
-      return res.status(403).json({ message: "Not allowed" });
-    }
-
-    if (!title || !message || !target_type) {
+    if (!title || !message) {
       return res.status(400).json({ message: "Missing required fields" });
     }
 
-    // Validate target_type
-    const allowedTargets = ["all", "department", "class"];
-    if (!allowedTargets.includes(target_type)) {
-      return res.status(400).json({ message: "Invalid target type" });
-    }
-
-    // If target_type is department or class, target_id must exist
-    let finalTargetId = null;
-
-    if (target_type === "department") {
-      finalTargetId = target_id || user.dept_id;
-    } else if (target_type === "class") {
-      finalTargetId = target_id;
-    }
+    const createdBy = user.id;
 
     const [result] = await pool.query(
-      `INSERT INTO announcements (title, message, target_type, target_id, created_by)
+      `INSERT INTO announcements 
+       (title, message, target_type, target_id, created_by)
        VALUES (?, ?, ?, ?, ?)`,
-      [title, message, target_type, finalTargetId, user.username]
+      [title, message, target_type, target_id, createdBy]
     );
 
-    res.json({ message: "Announcement created", id: result.insertId });
+    return res.json({
+      message: "Announcement posted successfully",
+      id: result.insertId
+    });
 
   } catch (err) {
-    console.error("❌ Error creating announcement:", err);
+    console.error("❌ Error posting announcement:", err);
     res.status(500).json({ message: "Server error" });
   }
 });
-
 
 app.patch("/api/announcements/:id", authenticateToken, async (req, res) => {
   try {
     const user = req.user;
     const { id } = req.params;
-    const { title, message } = req.body;
+    const { title, message, target_type, target_id } = req.body;
 
-    const [rows] = await pool.query(
-      `SELECT * FROM announcements WHERE id = ?`,
-      [id]
-    );
-
+    const [rows] = await pool.query(`SELECT * FROM announcements WHERE id=?`, [id]);
     if (!rows.length) return res.status(404).json({ message: "Not found" });
 
     const announcement = rows[0];
+    const isOwner = announcement.created_by === user.email;
 
-    // Permission check
-    if (announcement.created_by !== user.username && !["Principal", "HOD"].includes(user.role)) {
-      return res.status(403).json({ message: "Not allowed to edit this" });
+    let allowed = false;
+
+    // principal can edit all
+    if (user.role === "Principal") allowed = true;
+
+    // hod can edit all in their dept
+    if (user.role === "HOD") allowed = true;
+
+    if (user.role === "CA") allowed = true;
+
+
+    // ca and staff only their own
+    if (["CA", "staff"].includes(user.role) && isOwner) {
+      allowed = true;
     }
 
-    const updatedTitle = title ?? announcement.title;
-    const updatedMessage = message ?? announcement.message;
+    if (!allowed) {
+      return res.status(403).json({ message: "You cannot edit this announcement" });
+    }
 
     await pool.query(
-      `UPDATE announcements SET title = ?, message = ? WHERE id = ?`,
-      [updatedTitle, updatedMessage, id]
+      `UPDATE announcements 
+       SET title=?, message=?, target_type=?, target_id=? 
+       WHERE id=?`,
+      [title, message, target_type, target_id, id]
     );
 
     res.json({ message: "Updated successfully" });
 
   } catch (err) {
-    console.error("❌ Error updating announcement:", err);
+    console.error(err);
     res.status(500).json({ message: "Server error" });
   }
 });
+
+app.delete("/api/announcements/:id", authenticateToken, async (req, res) => {
+  try {
+    const user = req.user;           // user from JWT
+    const announcementId = req.params.id;
+
+    // Get announcement info
+    const [rows] = await pool.query(
+      `SELECT id, created_by, target_type, target_id 
+       FROM announcements 
+       WHERE id = ?`,
+      [announcementId]
+    );
+
+    if (!rows.length) {
+      return res.status(404).json({ message: "Announcement not found" });
+    }
+
+    const announcement = rows[0];
+    const isOwner = Number(announcement.created_by) === Number(user.id);
+
+    // -----------------------------------
+    // ROLE-BASED DELETE PERMISSIONS
+    // -----------------------------------
+    let allowed = false;
+
+    // 1. Principal — delete anything
+    if (user.role === "Principal") {
+      allowed = true;
+    }
+
+    // 2. HOD — delete anything in department (all class + dept posts)
+    else if (user.role === "HOD") {
+      allowed = true;
+    }
+
+    // 3. CA — delete only their own posts
+    else if (user.role === "CA") {
+      if (isOwner) allowed = true;
+    }
+
+    // 4. Staff — delete only their own posts
+    else if (user.role === "staff") {
+      if (isOwner) allowed = true;
+    }
+
+    // 5. Students — cannot delete at all
+    else {
+      allowed = false;
+    }
+
+    if (!allowed) {
+      return res.status(403).json({ message: "You are not allowed to delete this announcement" });
+    }
+
+    // Perform delete
+    await pool.query(`DELETE FROM announcements WHERE id = ?`, [announcementId]);
+
+    res.json({ message: "Deleted successfully" });
+
+  } catch (err) {
+    console.error("❌ DELETE /announcements error:", err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
 
 
 // Get profile
