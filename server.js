@@ -345,7 +345,7 @@ app.post("/api/attendance", authenticateToken, authorize(["Staff", "CA"]), async
       [markedBy]
     );
 
-    const caClasses = allowedRows.filter(r => r.access_type === "CA").map(r => r.class_id);
+    const caClasses = allowedRows.filter(r => r.access_type.toUpperCase() === "CA").map(r => r.class_id);
 
     if (caClasses.length === 0) {
       return res.status(403).json({ message: "You are not allowed to mark attendance for any class" });
@@ -572,9 +572,6 @@ app.delete("/api/student/:student_id",
     }
   }
 );
-
-
-
 
 // --- Get Students by Class ---
 app.get('/api/classes/:classId/students', authenticateToken, async (req, res) => {
@@ -1369,59 +1366,54 @@ app.get('/api/assignments/:reg_no', authenticateToken, async (req, res) => {
   }
 });
 
-
 app.get("/api/announcements", authenticateToken, async (req, res) => {
   try {
     const user = req.user;
 
-    if (!user)
+    if (!user) {
       return res.status(403).json({ message: "Access denied" });
+    }
 
     let dept_id = null;
     let class_id = null;
 
+    // --- Student: get dept + class
     if (user.role === "student") {
       const [rows] = await pool.query(
         `SELECT dept_id, class_id FROM students WHERE roll_no = ?`,
         [user.roll_no]
       );
-      if (!rows.length)
-        return res.status(404).json({ message: "Student not found" });
+      if (!rows.length) return res.status(404).json({ message: "Student not found" });
 
       dept_id = rows[0].dept_id;
       class_id = rows[0].class_id;
     }
-    else if (user.role === "staff") {
-      const [rows] = await pool.query(
-        `SELECT dept_id FROM users WHERE user_id = ?`,
-        [user.id]
-      );
-      if (!rows.length)
-        return res.status(404).json({ message: "Staff not found" });
 
-      dept_id = rows[0].dept_id;
-    }
-    else if (user.role === "CA") {
-      const [rows] = await pool.query(
-        `SELECT dept_id FROM users WHERE user_id = ?`,
-        [user.id]
-      );
-      if (!rows.length)
-        return res.status(404).json({ message: "Staff not found" });
-
-      dept_id = rows[0].dept_id;
-    }
+    // --- Staff / CA / HOD: get dept only
     else {
-      return res.status(403).json({ message: "Invalid role" });
+      const [rows] = await pool.query(
+        `SELECT dept_id, assigned_class_id FROM users WHERE user_id = ?`,
+        [user.id]
+      );
+      if (!rows.length) return res.status(404).json({ message: "User not found" });
+
+      dept_id = rows[0].dept_id;
+      class_id = rows[0].assigned_class_id || null;
     }
 
+    // --- Base query
     let query = `
-      SELECT id, title, message, created_at, created_by
+      SELECT id, title, message, target_type, target_id, created_at, created_by
       FROM announcements
       WHERE target_type = 'all'
     `;
     const params = [];
 
+    // -----------------------------
+    // Role-based filtering
+    // -----------------------------
+
+    // STUDENT
     if (user.role === "student") {
       query += `
         OR (target_type = 'department' AND target_id = ?)
@@ -1429,6 +1421,28 @@ app.get("/api/announcements", authenticateToken, async (req, res) => {
       `;
       params.push(dept_id, class_id);
     }
+
+    // CA
+    else if (user.role === "CA") {
+      query += `
+        OR (target_type = 'department' AND target_id = ?)
+        OR (target_type = 'class' AND target_id = ?)
+      `;
+      params.push(dept_id, class_id);
+    }
+
+    // HOD
+    else if (user.role === "HOD") {
+      query += `
+        OR (target_type = 'department' AND target_id = ?)
+        OR (target_type = 'class' AND target_id IN (
+          SELECT class_id FROM classes WHERE dept_id = ?
+        ))
+      `;
+      params.push(dept_id, dept_id);
+    }
+
+    // STAFF
     else if (user.role === "staff") {
       query += `
         OR (target_type = 'department' AND target_id = ?)
@@ -1436,11 +1450,21 @@ app.get("/api/announcements", authenticateToken, async (req, res) => {
       params.push(dept_id);
     }
 
+    // PRINCIPAL sees everything
+    else if (user.role === "Principal") {
+      query = `
+        SELECT id, title, message, target_type, target_id, created_at, created_by
+        FROM announcements
+      `;
+    }
+
+    // Sort
     query += ` ORDER BY created_at DESC`;
 
     const [announcements] = await pool.query(query, params);
 
     res.json(announcements);
+
   } catch (err) {
     console.error("❌ Error fetching announcements:", err);
     res.status(500).json({ message: "Server error" });
@@ -1448,6 +1472,85 @@ app.get("/api/announcements", authenticateToken, async (req, res) => {
 });
 
 
+app.post("/api/announcements", authenticateToken, async (req, res) => {
+  try {
+    const user = req.user;
+    const { title, message, target_type, target_id } = req.body;
+
+    // only CA, HOD, PRINCIPAL, STAFF can post
+    if (!["CA", "HOD", "Principal", "staff"].includes(user.role)) {
+      return res.status(403).json({ message: "Not allowed" });
+    }
+
+    if (!title || !message || !target_type) {
+      return res.status(400).json({ message: "Missing required fields" });
+    }
+
+    // Validate target_type
+    const allowedTargets = ["all", "department", "class"];
+    if (!allowedTargets.includes(target_type)) {
+      return res.status(400).json({ message: "Invalid target type" });
+    }
+
+    // If target_type is department or class, target_id must exist
+    let finalTargetId = null;
+
+    if (target_type === "department") {
+      finalTargetId = target_id || user.dept_id;
+    } else if (target_type === "class") {
+      finalTargetId = target_id;
+    }
+
+    const [result] = await pool.query(
+      `INSERT INTO announcements (title, message, target_type, target_id, created_by)
+       VALUES (?, ?, ?, ?, ?)`,
+      [title, message, target_type, finalTargetId, user.username]
+    );
+
+    res.json({ message: "Announcement created", id: result.insertId });
+
+  } catch (err) {
+    console.error("❌ Error creating announcement:", err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
+
+
+app.patch("/api/announcements/:id", authenticateToken, async (req, res) => {
+  try {
+    const user = req.user;
+    const { id } = req.params;
+    const { title, message } = req.body;
+
+    const [rows] = await pool.query(
+      `SELECT * FROM announcements WHERE id = ?`,
+      [id]
+    );
+
+    if (!rows.length) return res.status(404).json({ message: "Not found" });
+
+    const announcement = rows[0];
+
+    // Permission check
+    if (announcement.created_by !== user.username && !["Principal", "HOD"].includes(user.role)) {
+      return res.status(403).json({ message: "Not allowed to edit this" });
+    }
+
+    const updatedTitle = title ?? announcement.title;
+    const updatedMessage = message ?? announcement.message;
+
+    await pool.query(
+      `UPDATE announcements SET title = ?, message = ? WHERE id = ?`,
+      [updatedTitle, updatedMessage, id]
+    );
+
+    res.json({ message: "Updated successfully" });
+
+  } catch (err) {
+    console.error("❌ Error updating announcement:", err);
+    res.status(500).json({ message: "Server error" });
+  }
+});
 
 
 // Get profile
@@ -1651,8 +1754,7 @@ app.get("/api/admin/overview", authenticateToken, authorize(["Principal", "HOD",
 });
 
 
-app.put(
-  "/api/student/:studentId",
+app.put("/api/student/:studentId",
   authenticateToken,
   authorize(["Staff", "CA", "HOD", "Principal"]),
   async (req, res) => {
@@ -2486,114 +2588,69 @@ app.post("/api/assistant", authenticateToken, async (req, res) => {
     const user = req.user;
     const { message } = req.body;
 
-
     if (!message || message.trim() === "") {
       return res.status(400).json({ message: "Message cannot be empty" });
     }
 
+    // FETCH LAST 20 MESSAGES
+    const [history] = await db.query(
+      "SELECT role, message FROM assistant_chat WHERE user_id = ? ORDER BY id ASC LIMIT 20",
+      [user.id]
+    );
 
-    // Convert dept_id -> Department Name
-    const deptMap = {
-      1: "CSE",
-      2: "ECE",
-      3: "EEE",
-      4: "IT",
-      5: "Mechanical",
-      6: "Civil",
-      7: "AI & DS",
-      8: "AIML",
+    // Convert history to Groq format
+    const pastMessages = history.map(msg => ({
+      role: msg.role,
+      content: msg.message
+    }));
+
+    // Your static system message
+    const systemMessage = {
+      role: "system",
+      content: `You are a friendly MNMJEC ERP assistant...`
     };
 
-    const departmentName = deptMap[user.dept_id] || "Not provided";
+    // Build finalPrompt (as you already wrote)
+    const finalPrompt = `User info... User says: "${message}"`;
 
+    // Build final messages array
+    const messages = [
+      systemMessage,
+      ...pastMessages,
+      { role: "user", content: finalPrompt }
+    ];
 
-    // Convert assigned_class_id -> Year
-    const yearMap = {
-      1: "1st Year",
-      2: "2nd Year",
-      3: "3rd Year",
-      4: "4th Year",
-    };
-
-    const yearName = yearMap[user.assigned_class_id] || "Not provided";
-
-
-    // Final Prompt
-    const finalPrompt = `
-You are a friendly AI assistant inside the MNMJEC college ERP system.
-
-Personality:
-- Helpful, quick, 1–2 line replies
-- Slightly fun and warm 😄
-- Can answer general questions (date, time, etc.)
-- ERP answers must be accurate
-- Use emojis where needed
-- Only mention the developer when directly asked, and say "Abinanthan V".
-
-User info:
-- Name: ${user.name}
-- Role: ${user.role}
-- Department: ${departmentName}
-- Year: ${yearName}
-- Register No: ${user.roll_no || "Not provided"}
-
-User says: "${message}"
-
-Use this info only for context. Don't reveal private details.
-`;
-
+    // CALL GROQ
     const completion = await groq.chat.completions.create({
       model: "llama-3.1-8b-instant",
-      messages: [
-        // system message
-        {
-          role: "system",
-          content: `
-You are a friendly, smart AI assistant for the Misrimal Navajee Munoth Jain Engineering College (MNMJEC) ERP system.
-
-Background:
-- MNMJEC is in Thoraipakkam / Old Mahabalipuram Road, Chennai – 600097.
-- Established in 1994 by TEAM Trust.
-- Offers B.E./B.Tech (CSE, ECE, Mechanical, Civil, EEE, IT, etc.), M.E./M.Tech, MBA.
-- Facilities include library, hostel, canteen, transport, labs, sports, medical room.
-- Has a placement & training cell with industry tie-ups.
-
-Personality & Rules:
-- Keep answers **short: 1–2 lines only**.
-- Be friendly, clear, slightly fun 😄 but still professional.
-- Answer ERP questions accurately (attendance, marks, fees, etc.).
-- Answer MNMJEC general questions using background knowledge.
-- You may answer general common questions (date, time, simple facts).
-- Use emojis occasionally, never too many.
-- **Never mention Groq, OpenAI, Cohere, or any provider.**
-- **Do NOT mention the developer unless asked.**
-- If asked “Who built you?” or “Who is Abinanthan?” reply:
-  "I was created by Abinanthan V, IV Year CSE, MNMJEC (2022–2026 Batch)."
-`
-        },
-
-
-
-
-        { role: "user", content: finalPrompt }
-      ],
+      messages,
       max_tokens: 300,
       temperature: 0.6
     });
 
-
     const reply = completion.choices[0]?.message?.content || "No response";
 
-
+    // SAVE USER MESSAGE + BOT RESPONSE
+    await db.query(
+      "INSERT INTO assistant_chat (user_id, role, message) VALUES (?, ?, ?)",
+      [user.id, "user", message]
+    );
+    await db.query(
+      "INSERT INTO assistant_chat (user_id, role, message) VALUES (?, ?, ?)",
+      [user.id, "assistant", reply]
+    );
 
     return res.json({ reply });
 
   } catch (err) {
-    console.error("\n===== GROQ AI ERROR =====");
     console.error(err);
     return res.status(500).json({ message: "AI request failed" });
   }
 });
+
+
+
+
 
 ////////////////
 
@@ -2636,7 +2693,6 @@ app.get('/api/mess/auto-count', authenticateToken, authorize(['Principal', 'HOD'
   }
 });
 
-
 app.post('/api/mess/save', authenticateToken, authorize(['Principal', 'HOD', 'MessAdmin']), async (req, res) => {
   const { date, jain_count, non_jain_count } = req.body;
   const created_by = req.user.name;
@@ -2664,6 +2720,78 @@ app.post('/api/mess/save', authenticateToken, authorize(['Principal', 'HOD', 'Me
     });
   }
 });
+
+
+app.post('/api/mess/payment', authenticateToken, authorize(['Principal', 'HOD', 'MessAdmin']), async (req, res) => {
+  try {
+    const { from_date, to_date, total_plates, price_per_plate } = req.body;
+    const paid_by = req.user.name;
+
+    const total_amount = total_plates * price_per_plate;
+
+    await pool.query(`
+      INSERT INTO mess_payments(from_date, to_date, total_plates, price_per_plate, total_amount, paid_by)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `, [from_date, to_date, total_plates, price_per_plate, total_amount, paid_by]);
+
+    res.json({ success: true, message: "Payment recorded successfully" });
+
+  } catch (err) {
+    console.error("Payment save error:", err);
+    res.status(500).json({ success: false, message: "Payment save failed" });
+  }
+});
+
+
+app.get('/api/mess/payment/history', authenticateToken, authorize(['Principal', 'HOD', 'MessAdmin']), async (req, res) => {
+  try {
+    const [rows] = await pool.query(`
+      SELECT 
+        id,
+        DATE_FORMAT(from_date,'%Y-%m-%d') AS from_date,
+        DATE_FORMAT(to_date,'%Y-%m-%d') AS to_date,
+        total_plates,
+        price_per_plate,
+        total_amount,
+        paid_by,
+        paid_on
+      FROM mess_payments
+      ORDER BY paid_on DESC
+    `);
+
+    res.json({ success: true, records: rows });
+
+  } catch (err) {
+    res.status(500).json({ success: false, message: "Failed to load payment history" });
+  }
+});
+
+
+app.get('/api/mess/payment/next-start', authenticateToken, authorize(['Principal', 'HOD', 'MessAdmin']), async (req, res) => {
+  try {
+    const [rows] = await pool.query(`
+      SELECT to_date FROM mess_payments ORDER BY to_date DESC LIMIT 1
+    `);
+
+    if (!rows.length) {
+      return res.json({
+        success: true,
+        next_start: null // means college started fresh
+      });
+    }
+
+    const lastPaid = new Date(rows[0].to_date);
+    lastPaid.setDate(lastPaid.getDate() + 1);
+
+    const next_start = lastPaid.toISOString().split("T")[0];
+
+    res.json({ success: true, next_start });
+
+  } catch (err) {
+    res.status(500).json({ success: false, message: "Failed to load next start date" });
+  }
+});
+
 
 
 app.get('/api/mess/history', authenticateToken, authorize(['Principal', 'HOD', 'MessAdmin']), async (req, res) => {
@@ -2716,28 +2844,24 @@ app.get('/api/mess/range', authenticateToken, authorize(['Principal', 'HOD', 'Me
       WHERE date BETWEEN ? AND ?
     `, [from, to]);
 
-    const plate_cost = 55; // adjust if needed  
-    const total_amount = rows[0].total_plates * plate_cost;
-
     res.json({
       success: true,
       from,
       to,
       jain_total: rows[0].jain_total || 0,
       non_jain_total: rows[0].non_jain_total || 0,
-      total_plates: rows[0].total_plates || 0,
-      plate_rate: plate_cost,
-      total_amount
+      total_plates: rows[0].total_plates || 0
     });
 
   } catch (err) {
-    console.error("Error calculating range bill:", err);
+    console.error("Error calculating mess range:", err);
     res.status(500).json({
       success: false,
-      message: "Server error while calculating mess bill"
+      message: "Server error while calculating mess count"
     });
   }
 });
+
 
 
 
