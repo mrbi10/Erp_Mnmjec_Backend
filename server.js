@@ -179,6 +179,69 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
+app.get('/api/users', authenticateToken, async (req, res) => {
+  try {
+    const { role: filterRole, dept_id, assigned_class_id } = req.query;
+    const { role, id: userId, dept_id: userDept } = req.user;
+
+    let query = `
+      SELECT 
+        u.user_id,
+        u.name,
+        u.email,
+        u.role,
+        u.dept_id,
+        u.assigned_class_id
+      FROM users u
+      WHERE 1=1
+    `;
+    const params = [];
+
+    // 🔐 Role-based visibility
+    if (role === 'Staff') {
+      query += ' AND u.user_id = ?';
+      params.push(userId);
+    }
+
+    if (role === 'HOD') {
+      query += ' AND u.dept_id = ?';
+      params.push(userDept);
+    }
+
+    // 🎯 Optional filters
+    if (filterRole) {
+      query += ' AND u.role = ?';
+      params.push(filterRole);
+    }
+
+    if (dept_id) {
+      query += ' AND u.dept_id = ?';
+      params.push(dept_id);
+    }
+
+    if (assigned_class_id) {
+      query += ' AND u.assigned_class_id = ?';
+      params.push(assigned_class_id);
+    }
+
+    query += ' ORDER BY u.role, u.name';
+
+    const [rows] = await pool.query(query, params);
+
+    res.json({
+      success: true,
+      users: rows
+    });
+  } catch (err) {
+    console.error('❌ Error in /api/users:', err);
+    res.status(500).json({
+      success: false,
+      message: 'Server error'
+    });
+  }
+});
+
+
 
 
 // GET /api/students
@@ -1168,6 +1231,247 @@ app.get("/api/timetable/today/:roll_no", authenticateToken, async (req, res) => 
   }
 });
 
+app.post(
+  "/api/timetable/save",
+  authenticateToken,
+  authorize(["CA", "HOD", "Principal"]),
+  async (req, res) => {
+    const {
+      dept_id,
+      class_id,
+      subject_id,
+      day,
+      start_time,
+      end_time,
+      room,
+      staff_id
+    } = req.body;
+
+    try {
+      // ---------- ROLE VALIDATION ----------
+
+      // CA → only own class
+      if (req.user.role === "CA" && req.user.class_id !== class_id) {
+        return res.status(403).json({ message: "Not allowed for this class" });
+      }
+
+      // HOD → only own department
+      if (req.user.role === "HOD" && req.user.dept_id !== dept_id) {
+        return res.status(403).json({ message: "Not allowed for this department" });
+      }
+
+      // ---------- UPSERT ----------
+      await pool.query(
+        `
+        INSERT INTO timetable
+          (dept_id, class_id, subject_id, day, start_time, end_time, room, staff_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON DUPLICATE KEY UPDATE
+          subject_id = VALUES(subject_id),
+          end_time   = VALUES(end_time),
+          room       = VALUES(room),
+          staff_id   = VALUES(staff_id)
+        `,
+        [
+          dept_id,
+          class_id,
+          subject_id,
+          day,
+          start_time,
+          end_time,
+          room,
+          staff_id
+        ]
+      );
+
+      res.json({
+        success: true,
+        message: "Timetable saved successfully"
+      });
+
+    } catch (err) {
+      console.error("Timetable save error:", err);
+      res.status(500).json({ message: "Server error while saving timetable" });
+    }
+  }
+);
+
+
+app.patch(
+  "/api/timetable/update/:id",
+  authenticateToken,
+  authorize(["CA", "HOD", "Principal"]),
+  async (req, res) => {
+    const { id } = req.params;
+    const { subject_id, end_time, room, staff_id } = req.body;
+
+    try {
+      const [[row]] = await pool.query(
+        `SELECT class_id, dept_id FROM timetable WHERE id = ?`,
+        [id]
+      );
+
+      if (!row) {
+        return res.status(404).json({ message: "Timetable entry not found" });
+      }
+
+      // CA restriction
+      if (req.user.role === "CA" && row.class_id !== req.user.class_id) {
+        return res.status(403).json({ message: "Not allowed" });
+      }
+
+      // HOD restriction
+      if (req.user.role === "HOD" && row.dept_id !== req.user.dept_id) {
+        return res.status(403).json({ message: "Not allowed" });
+      }
+
+      await pool.query(
+        `
+        UPDATE timetable
+        SET subject_id = ?, end_time = ?, room = ?, staff_id = ?
+        WHERE id = ?
+        `,
+        [subject_id, end_time, room, staff_id, id]
+      );
+
+      res.json({
+        success: true,
+        message: "Timetable updated successfully"
+      });
+
+    } catch (err) {
+      console.error("Timetable update error:", err);
+      res.status(500).json({ message: "Server error" });
+    }
+  }
+);
+
+app.get(
+  "/api/timetable/class/:class_id",
+  authenticateToken,
+  authorize(["CA", "HOD", "Principal"]),
+  async (req, res) => {
+    const { class_id } = req.params;
+
+    try {
+      if (req.user.role === "CA" && req.user.class_id !== Number(class_id)) {
+        return res.status(403).json({ message: "Not allowed" });
+      }
+
+      const [rows] = await pool.query(
+        `
+        SELECT
+          t.id,
+          t.dept_id,
+          t.class_id,
+          t.day,
+          t.start_time,
+          t.end_time,
+          t.room,
+          s.subject_id,
+          s.subject_name,
+          u.user_id AS staff_id,
+          u.name AS staff_name
+        FROM timetable t
+        JOIN subjects s ON t.subject_id = s.subject_id
+        LEFT JOIN users u ON t.staff_id = u.user_id
+        WHERE t.class_id = ?
+        ORDER BY FIELD(
+          t.day,
+          'Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'
+        ),
+        t.start_time
+        `,
+        [class_id]
+      );
+
+      if (req.user.role === "HOD") {
+        const invalid = rows.some(r => r.dept_id !== req.user.dept_id);
+        if (invalid) {
+          return res.status(403).json({ message: "Not allowed" });
+        }
+      }
+
+      res.json(rows);
+    } catch (err) {
+      console.error("Timetable fetch error:", err);
+      res.status(500).json({ message: "Server error" });
+    }
+  }
+);
+
+
+app.get(
+  "/api/timetable/meta",
+  authenticateToken,
+  authorize(["CA", "HOD", "Principal"]),
+  async (req, res) => {
+    try {
+      const params = [];
+      let whereClause = "";
+
+      // ---------------- ROLE FILTERS ----------------
+
+      if (req.user.role === "HOD") {
+        whereClause = "WHERE c.dept_id = ?";
+        params.push(req.user.dept_id);
+      }
+
+      if (req.user.role === "CA") {
+        whereClause = "WHERE c.class_id = ?";
+        params.push(req.user.class_id);
+      }
+
+      // ---------------- QUERY ----------------
+
+      const [rows] = await pool.query(
+        `
+        SELECT DISTINCT
+          d.dept_id,
+          d.name AS dept_name,
+          c.class_id,
+          c.dept_id AS class_dept_id,
+          c.year,
+        FROM classes c
+        JOIN departments d ON d.dept_id = c.dept_id
+        ${whereClause}
+        ORDER BY d.name, c.year, c.section
+        `,
+        params
+      );
+
+      // ---------------- SHAPE RESPONSE ----------------
+
+      const departments = [];
+      const classes = [];
+
+      rows.forEach(r => {
+        if (!departments.find(d => d.dept_id === r.dept_id)) {
+          departments.push({
+            dept_id: r.dept_id,
+            dept_name: r.dept_name
+          });
+        }
+
+        classes.push({
+          class_id: r.class_id,
+          dept_id: r.class_dept_id,
+          class_name: `${r.year}${r.section}`
+        });
+      });
+
+      res.json({
+        success: true,
+        departments,
+        classes
+      });
+
+    } catch (err) {
+      console.error("Timetable meta error:", err);
+      res.status(500).json({ message: "Server error" });
+    }
+  }
+);
 
 
 // Get notifications
@@ -1446,7 +1750,7 @@ app.get("/api/announcements", authenticateToken, async (req, res) => {
       params.push(dept_id, dept_id);
     }
 
-    // PRINCIPAL sees everything
+    // Principal sees everything
     else if (user.role === "Principal") {
       query = `
         SELECT 
@@ -2754,33 +3058,39 @@ app.get('/api/mess/auto-count', authenticateToken, authorize(['Principal', 'HOD'
   }
 });
 
-app.post('/api/mess/save', authenticateToken, authorize(['Principal', 'HOD', 'MessAdmin']), async (req, res) => {
-  const { date, jain_count, non_jain_count } = req.body;
-  const created_by = req.user.name;
+app.post(
+  '/api/mess/save',
+  authenticateToken,
+  authorize(['Principal', 'HOD', 'MessAdmin']),
+  async (req, res) => {
+    const { date, jain_count, non_jain_count } = req.body;
+    const created_by = req.user.name;
 
-  try {
-    await pool.query(`
-      INSERT INTO mess_count (date, jain_count, non_jain_count, created_by)
-      VALUES (?, ?, ?, ?)
-      ON DUPLICATE KEY UPDATE 
-        jain_count = VALUES(jain_count),
-        non_jain_count = VALUES(non_jain_count),
-        created_by = VALUES(created_by)
-    `, [date, jain_count, non_jain_count, created_by]);
+    try {
+      await pool.query(`
+        INSERT INTO mess_count (date, jain_count, non_jain_count, created_by)
+        VALUES (?, ?, ?, ?)
+        ON DUPLICATE KEY UPDATE 
+          jain_count = VALUES(jain_count),
+          non_jain_count = VALUES(non_jain_count),
+          created_by = VALUES(created_by)
+      `, [date, jain_count, non_jain_count, created_by]);
 
-    res.json({
-      success: true,
-      message: "Mess count saved successfully"
-    });
+      res.json({
+        success: true,
+        message: "Mess count saved successfully"
+      });
 
-  } catch (err) {
-    console.error("Error saving mess count:", err);
-    res.status(500).json({
-      success: false,
-      message: "Server error while saving mess count"
-    });
+    } catch (err) {
+      console.error("Error saving mess count:", err);
+      res.status(500).json({
+        success: false,
+        message: "Server error while saving mess count"
+      });
+    }
   }
-});
+);
+
 
 
 app.post('/api/mess/payment', authenticateToken, authorize(['Principal', 'HOD', 'MessAdmin']), async (req, res) => {
