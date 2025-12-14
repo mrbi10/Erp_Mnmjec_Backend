@@ -1404,7 +1404,7 @@ app.get(
 app.get(
   "/api/timetable/meta",
   authenticateToken,
-  authorize(["CA", "HOD", "Principal"]),
+  authorize(["CA", "HOD", "student","Principal"]),
   async (req, res) => {
     try {
       const params = [];
@@ -1431,11 +1431,11 @@ app.get(
           d.name AS dept_name,
           c.class_id,
           c.dept_id AS class_dept_id,
-          c.year,
+          c.year
         FROM classes c
         JOIN departments d ON d.dept_id = c.dept_id
         ${whereClause}
-        ORDER BY d.name, c.year, c.section
+        ORDER BY d.name, c.year
         `,
         params
       );
@@ -1456,9 +1456,10 @@ app.get(
         classes.push({
           class_id: r.class_id,
           dept_id: r.class_dept_id,
-          class_name: `${r.year}${r.section}`
+          class_name: `${r.year}`
         });
       });
+
 
       res.json({
         success: true,
