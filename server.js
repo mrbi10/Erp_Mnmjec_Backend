@@ -1349,7 +1349,7 @@ app.patch(
 app.get(
   "/api/timetable/class/:class_id",
   authenticateToken,
-  authorize(["CA", "HOD", "Principal"]),
+  authorize(["CA", "HOD","student" ,"Principal"]),
   async (req, res) => {
     const { class_id } = req.params;
 
