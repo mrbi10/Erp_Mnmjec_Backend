@@ -2264,61 +2264,87 @@ app.get('/api/performance/:reg_no', authenticateToken, async (req, res) => {
   }
 });
 
-app.get("/api/admin/overview", authenticateToken, authorize(["Principal", "HOD", "CA", "Staff"]), async (req, res) => {
-  try {
-    const { classId } = req.query;
-    const today = new Date().toISOString().split("T")[0];
+app.get(
+  "/api/admin/overview",
+  authenticateToken,
+  authorize(["Principal", "HOD", "CA", "Staff"]),
+  async (req, res) => {
+    try {
+      const { deptId, classId } = req.query;
+      const today = new Date().toISOString().split("T")[0];
 
-    const classFilter = classId ? "WHERE s.class_id = ?" : "";
-    const params = classId ? [classId] : [];
+      // ---- Dynamic filters ----
+      let whereClause = "WHERE 1=1";
+      const params = [];
 
-    // --- Total students breakdown ---
-    const [totals] = await pool.query(
-      `SELECT 
-        COUNT(*) AS total_students,
-        SUM(s.jain = 1) AS total_jain,
-        SUM(s.hostel = 1) AS total_hostel,
-        SUM(s.bus = 1) AS total_bus
-      FROM students s
-      ${classFilter}`,
-      params
-    );
+      if (deptId) {
+        whereClause += " AND s.dept_id = ?";
+        params.push(deptId);
+      }
 
-    // --- Today's presence breakdown ---
-    const [present] = await pool.query(
-      `SELECT 
-        COUNT(DISTINCT a.student_id) AS present_today,
-        SUM(s.jain = 1) AS present_jain,
-        SUM(s.hostel = 1) AS present_hostel,
-        SUM(s.bus = 1) AS present_bus
-      FROM attendance a
-      JOIN students s ON a.student_id = s.student_id
-      WHERE a.date = ? AND a.status = 'Present'
-      ${classId ? "AND s.class_id = ?" : ""}`,
-      classId ? [today, classId] : [today]
-    );
+      if (classId) {
+        whereClause += " AND s.class_id = ?";
+        params.push(classId);
+      }
 
-    res.json({
-      total_students: totals[0].total_students || 0,
-      present_today: present[0].present_today || 0,
-      jain_students: {
-        total: totals[0].total_jain || 0,
-        present: present[0].present_jain || 0,
-      },
-      hostel_students: {
-        total: totals[0].total_hostel || 0,
-        present: present[0].present_hostel || 0,
-      },
-      bus_students: {
-        total: totals[0].total_bus || 0,
-        present: present[0].present_bus || 0,
-      },
-    });
-  } catch (err) {
-    console.error("Error fetching admin overview:", err);
-    res.status(500).json({ message: "Server error while fetching overview" });
+      // ---- Total students ----
+      const [totals] = await pool.query(
+        `
+        SELECT 
+          COUNT(*) AS total_students,
+          SUM(s.jain = 1) AS total_jain,
+          SUM(s.hostel = 1) AS total_hostel,
+          SUM(s.bus = 1) AS total_bus
+        FROM students s
+        ${whereClause}
+        `,
+        params
+      );
+
+      // ---- Present today ----
+      const [present] = await pool.query(
+        `
+        SELECT 
+          COUNT(DISTINCT a.student_id) AS present_today,
+          SUM(s.jain = 1) AS present_jain,
+          SUM(s.hostel = 1) AS present_hostel,
+          SUM(s.bus = 1) AS present_bus
+        FROM attendance a
+        JOIN students s ON a.student_id = s.student_id
+        WHERE a.date = ? AND a.status = 'Present'
+        ${deptId ? "AND s.dept_id = ?" : ""}
+        ${classId ? "AND s.class_id = ?" : ""}
+        `,
+        [
+          today,
+          ...(deptId ? [deptId] : []),
+          ...(classId ? [classId] : []),
+        ]
+      );
+
+      res.json({
+        total_students: totals[0]?.total_students || 0,
+        present_today: present[0]?.present_today || 0,
+        jain_students: {
+          total: totals[0]?.total_jain || 0,
+          present: present[0]?.present_jain || 0,
+        },
+        hostel_students: {
+          total: totals[0]?.total_hostel || 0,
+          present: present[0]?.present_hostel || 0,
+        },
+        bus_students: {
+          total: totals[0]?.total_bus || 0,
+          present: present[0]?.present_bus || 0,
+        },
+      });
+    } catch (err) {
+      console.error("Error fetching admin overview:", err);
+      res.status(500).json({ message: "Server error while fetching overview" });
+    }
   }
-});
+);
+
 
 
 app.put("/api/student/:studentId",
