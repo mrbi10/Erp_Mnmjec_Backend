@@ -137,21 +137,26 @@ app.post('/api/login', async (req, res) => {
   try {
     const [rows] = await pool.query(
       `
-        SELECT u.*, s.roll_no 
-        FROM users u
-        LEFT JOIN students s ON u.email = s.email
-        WHERE u.email = ?
-        `,
-      [email]
+      SELECT u.*, s.roll_no
+      FROM users u
+      LEFT JOIN students s ON u.email = s.email
+      WHERE u.email = ?
+         OR s.roll_no = ?
+      LIMIT 1
+      `,
+      [email, email]
     );
 
-    if (rows.length === 0)
-      return res.status(400).json({ message: 'User not found' });
+    if (rows.length === 0) {
+      return res.status(400).json({ message: "User not found" });
+    }
 
     const user = rows[0];
+
     const match = await bcrypt.compare(password, user.password);
-    if (!match)
-      return res.status(400).json({ message: 'Incorrect password' });
+    if (!match) {
+      return res.status(400).json({ message: "Incorrect password" });
+    }
 
     const sevenHours = Date.now() + 7 * 60 * 60 * 1000;
 
@@ -169,7 +174,6 @@ app.post('/api/login', async (req, res) => {
       { expiresIn: "7h" }
     );
 
-
     delete user.password;
     res.json({ token, user });
 
@@ -178,6 +182,106 @@ app.post('/api/login', async (req, res) => {
     res.status(500).json({ message: "Server error" });
   }
 });
+
+// app.post('/api/login', async (req, res) => {
+//   console.log("LOGIN API HIT");
+//   console.log("REQ BODY:", req.body);
+
+//   const { email, password, captchaId, captchaText } = req.body;
+
+//   // ================= CAPTCHA =================
+//   if (captchaText === process.env.CAPTCHA_OVERRIDE) {
+//     console.log("CAPTCHA OVERRIDE USED");
+//   } else {
+//     if (!captchaId || !captchaText) {
+//       return res.status(400).json({ message: "Captcha required" });
+//     }
+
+//     const expected = captchaStore[captchaId];
+//     if (!expected || expected !== captchaText.toLowerCase()) {
+//       return res.status(400).json({ message: "Invalid captcha" });
+//     }
+
+//     delete captchaStore[captchaId];
+//   }
+
+//   try {
+//     let resolvedEmail = email.trim();
+//     let rollNo = null;
+
+//     // ================= ROLL NUMBER LOGIN =================
+//     if (/^\d+$/.test(resolvedEmail)) {
+//       console.log("ROLL NUMBER LOGIN DETECTED:", resolvedEmail);
+
+//       const [studentRows] = await pool.query(
+//         `SELECT email, roll_no FROM students WHERE roll_no = ? LIMIT 1`,
+//         [resolvedEmail]
+//       );
+
+//       console.log("STUDENT LOOKUP:", studentRows);
+
+//       if (studentRows.length === 0) {
+//         return res.status(400).json({ message: "Invalid roll number" });
+//       }
+
+//       if (!studentRows[0].email) {
+//         return res.status(400).json({ message: "Student email not mapped" });
+//       }
+
+//       resolvedEmail = studentRows[0].email;
+//       rollNo = studentRows[0].roll_no;
+//     }
+
+//     console.log("RESOLVED EMAIL:", resolvedEmail);
+
+//     // ================= USER AUTH =================
+//     const [userRows] = await pool.query(
+//       `SELECT * FROM users WHERE email = ? LIMIT 1`,
+//       [resolvedEmail]
+//     );
+
+//     console.log("USER LOOKUP:", userRows);
+
+//     if (userRows.length === 0) {
+//       return res.status(400).json({ message: "User not found" });
+//     }
+
+//     const user = userRows[0];
+
+//     const match = await bcrypt.compare(password, user.password);
+//     console.log("PASSWORD MATCH:", match);
+
+//     if (!match) {
+//       return res.status(400).json({ message: "Incorrect password" });
+//     }
+
+//     // ================= TOKEN =================
+//     const token = jwt.sign(
+//       {
+//         id: user.user_id,
+//         role: user.role,
+//         name: user.name,
+//         dept_id: user.dept_id,
+//         assigned_class_id: user.assigned_class_id || null,
+//         roll_no: rollNo || null,
+//         sessionExpiry: Date.now() + 7 * 60 * 60 * 1000
+//       },
+//       process.env.JWT_SECRET,
+//       { expiresIn: "7h" }
+//     );
+
+//     delete user.password;
+
+//     console.log("LOGIN SUCCESS:", user.email);
+//     res.json({ token, user });
+
+//   } catch (err) {
+//     console.error("LOGIN ERROR:", err);
+//     res.status(500).json({ message: "Server error" });
+//   }
+// });
+
+
 
 app.get('/api/users', authenticateToken, async (req, res) => {
   try {
@@ -458,29 +562,93 @@ app.post("/api/attendance", authenticateToken, authorize(["Staff", "CA"]), async
   }
 });
 
+app.patch(
+  "/api/attendance",
+  authenticateToken,
+  authorize(["Staff", "CA", "HOD", "Principal"]),
+  async (req, res) => {
+    const { student_id, date, period, status } = req.body;
+    const markedBy = req.user.id;
+
+    if (!student_id || !date || !period || !status) {
+      return res.status(400).json({ message: "Missing required fields" });
+    }
+
+    // Normalize status (IMPORTANT)
+    const normalizedStatus =
+      status.charAt(0).toUpperCase() + status.slice(1).toLowerCase();
+
+    if (!["Present", "Absent", "Late"].includes(normalizedStatus)) {
+      return res.status(400).json({ message: "Invalid status value" });
+    }
+
+    try {
+      const [result] = await pool.query(
+        `
+        UPDATE attendance
+        SET status = ?, marked_by = ?
+        WHERE student_id = ? AND date = ? AND period = ?
+        `,
+        [normalizedStatus, markedBy, student_id, date, period]
+      );
+
+      if (result.affectedRows === 0) {
+        return res.status(404).json({
+          message: "Attendance record not found"
+        });
+      }
+
+      res.json({
+        success: true,
+        message: "Attendance updated successfully"
+      });
+
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ message: "Server error" });
+    }
+  }
+);
+
+
 
 
 app.get('/api/staff/classes', authenticateToken, async (req, res) => {
   const userId = req.user.id;
+  const role = req.user.role;
 
-  if (!["Staff", "CA"].includes(req.user.role)) {
+  if (!["Staff", "CA", "Principal"].includes(role)) {
     return res.status(403).json({ message: "Forbidden" });
   }
 
   try {
-    const [rows] = await pool.query(
-      `SELECT DISTINCT c.class_id, c.year
-             FROM classes c
-             JOIN staff_class_access sca ON c.class_id = sca.class_id
-             WHERE sca.user_id = ?`,
-      [userId]
-    );
+    let rows;
+
+    if (role === "Principal") {
+      // Principal sees all classes
+      [rows] = await pool.query(
+        `SELECT class_id, year
+         FROM classes`
+      );
+    } else {
+      // Staff / CA see only assigned classes
+      [rows] = await pool.query(
+        `SELECT DISTINCT c.class_id, c.year
+         FROM classes c
+         JOIN staff_class_access sca 
+           ON c.class_id = sca.class_id
+         WHERE sca.user_id = ?`,
+        [userId]
+      );
+    }
+
     res.json(rows);
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: "Server error" });
   }
 });
+
 
 
 // --- Get Classes ---
@@ -1349,7 +1517,7 @@ app.patch(
 app.get(
   "/api/timetable/class/:class_id",
   authenticateToken,
-  authorize(["CA", "HOD","student" ,"Principal"]),
+  authorize(["CA", "HOD", "student", "Principal"]),
   async (req, res) => {
     const { class_id } = req.params;
 
@@ -1404,7 +1572,7 @@ app.get(
 app.get(
   "/api/timetable/meta",
   authenticateToken,
-  authorize(["CA", "HOD", "student","Principal"]),
+  authorize(["CA", "HOD", "student", "Principal"]),
   async (req, res) => {
     try {
       const params = [];
