@@ -357,13 +357,18 @@ app.get('/api/students', authenticateToken, async (req, res) => {
     switch (req.user.role) {
       case 'CA':
         query = `
-          SELECT s.* 
-          FROM students s
-          WHERE s.class_id = ?
-          ORDER BY s.roll_no ASC
-        `;
-        params = [req.user.assigned_class_id];
+    SELECT s.*
+    FROM students s
+    WHERE s.class_id = ?
+      AND s.dept_id = ?
+    ORDER BY s.roll_no ASC
+  `;
+        params = [
+          req.user.assigned_class_id,
+          req.user.dept_id
+        ];
         break;
+
 
       case 'Staff':
         query = `
