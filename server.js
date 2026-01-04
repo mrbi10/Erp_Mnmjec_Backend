@@ -810,19 +810,47 @@ app.delete("/api/student/:student_id",
 );
 
 // --- Get Students by Class ---
-app.get('/api/classes/:classId/students', authenticateToken, async (req, res) => {
-  const { classId } = req.params;
-  try {
-    const [rows] = await pool.query(
-      'SELECT * FROM students WHERE class_id = ?',
-      [classId]
-    );
-    res.json(rows);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: 'Server error' });
+app.get(
+  '/api/classes/:classId/students',
+  authenticateToken,
+  async (req, res) => {
+    const { classId } = req.params;
+    const { role, dept_id } = req.user;
+
+    try {
+      let query = '';
+      let params = [];
+
+      if (['CA', 'Staff', 'HOD'].includes(role)) {
+        query = `
+          SELECT *
+          FROM students
+          WHERE class_id = ?
+            AND dept_id = ?
+          ORDER BY roll_no ASC
+        `;
+        params = [classId, dept_id];
+      } else {
+        // Admin / Principal
+        query = `
+          SELECT *
+          FROM students
+          WHERE class_id = ?
+          ORDER BY roll_no ASC
+        `;
+        params = [classId];
+      }
+
+      const [rows] = await pool.query(query, params);
+      res.json(rows);
+
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ message: 'Server error' });
+    }
   }
-});
+);
+
 
 // --- Get Subjects by Class or Staff ---
 app.get('/api/subjects', authenticateToken, async (req, res) => {
