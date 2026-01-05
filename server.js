@@ -3505,7 +3505,7 @@ app.get(
       const rollNo = req.user.roll_no;
 
       const [[student]] = await pool.query(
-        "SELECT student_id FROM students WHERE roll_no = ?",
+        "SELECT student_id, dept_id, class_id FROM students WHERE roll_no = ?",
         [rollNo]
       );
 
@@ -3514,36 +3514,23 @@ app.get(
       }
 
       const [rows] = await pool.query(
-        `
-        SELECT 
-          tc.course_id,
-          tc.name,
-          tc.description,
-          tc.start_date,
-          tc.end_date,
-          tc.status,
+        `SELECT DISTINCT
+  tc.course_id,
+  tc.name,
+  tc.description,
+  tc.start_date,
+  tc.end_date,
+  tc.status
+FROM training_courses tc
+JOIN training_course_assignments ca
+  ON ca.course_id = tc.course_id
+WHERE
+  ca.dept_id = ?
+  AND ca.class_id = ?
+ORDER BY tc.start_date DESC
 
-          -- Test info
-          t.test_id,
-          t.published,
-
-          -- Attempt info
-          ta.attempt_id,
-          ta.score,
-          ta.pass_status,
-          ta.submitted_at
-
-        FROM training_enrollments te
-        JOIN training_courses tc ON te.course_id = tc.course_id
-        LEFT JOIN tests t ON t.course_id = tc.course_id AND t.published = 1
-        LEFT JOIN test_attempts ta 
-          ON ta.test_id = t.test_id 
-         AND ta.student_id = ?
-
-        WHERE te.student_id = ?
-        ORDER BY tc.start_date DESC
         `,
-        [student.student_id, student.student_id]
+        [student.dept_id, student.class_id]
       );
 
       res.json({
@@ -3557,69 +3544,218 @@ app.get(
     }
   }
 );
+
+app.get(
+  "/api/placement-training/courses/:courseId/tests",
+  authenticateToken,
+  authorize(["Staff", "CA", "HOD", "trainer", "Principal"]),
+  async (req, res) => {
+    try {
+      const { courseId } = req.params;
+
+      const [rows] = await pool.query(
+        `
+        SELECT
+          test_id,
+          title,
+          duration_minutes,
+          total_marks,
+          pass_mark,
+          max_attempts,
+          published,
+          created_at
+        FROM tests
+        WHERE course_id = ?
+        ORDER BY created_at DESC
+        `,
+        [courseId]
+      );
+
+      res.json({ success: true, tests: rows });
+
+    } catch (err) {
+      console.error("Fetch tests error:", err);
+      res.status(500).json({ message: "Server error" });
+    }
+  }
+);
+
+app.patch(
+  "/api/placement-training/questions/:questionId",
+  authenticateToken,
+  authorize(["Staff", "CA", "trainer", "HOD", "Principal"]),
+  async (req, res) => {
+    try {
+      const { questionId } = req.params;
+
+      const [[check]] = await pool.query(
+        `
+  SELECT t.published
+  FROM tests t
+  JOIN questions q ON q.test_id = t.test_id
+  WHERE q.question_id = ?
+  `,
+        [questionId]
+      );
+
+      if (check?.published === 1) {
+        return res.status(400).json({
+          message: "Cannot edit questions after test is published"
+        });
+      }
+
+      const {
+        question,
+        option_a,
+        option_b,
+        option_c,
+        option_d,
+        correct_option,
+        marks
+      } = req.body;
+
+      await pool.query(
+        `
+        UPDATE questions
+        SET
+          question = ?,
+          option_a = ?,
+          option_b = ?,
+          option_c = ?,
+          option_d = ?,
+          correct_option = ?,
+          marks = ?
+        WHERE question_id = ?
+        `,
+        [
+          question,
+          option_a,
+          option_b,
+          option_c,
+          option_d,
+          correct_option,
+          marks,
+          questionId
+        ]
+      );
+
+      res.json({ success: true });
+
+    } catch (err) {
+      console.error("Update question error:", err);
+      res.status(500).json({ message: "Server error" });
+    }
+  }
+);
+
+
+app.patch(
+  "/api/placement-training/tests/:testId/publish",
+  authenticateToken,
+  authorize(["trainer"]),
+  async (req, res) => {
+    try {
+      const { testId } = req.params;
+      const trainerId = req.user.id;
+
+      // Ensure test belongs to trainer (via course)
+      const [[test]] = await pool.query(
+        `
+        SELECT t.test_id, t.published
+        FROM tests t
+        JOIN training_courses c ON t.course_id = c.course_id
+        WHERE t.test_id = ? AND c.trainer_id = ?
+        `,
+        [testId, trainerId]
+      );
+
+      if (!test) {
+        return res.status(404).json({
+          message: "Test not found or access denied"
+        });
+      }
+
+      if (test.published === 1) {
+        return res.json({
+          success: true,
+          message: "Test already published"
+        });
+      }
+
+      const { publish_start, publish_end } = req.body;
+
+      if (!publish_start || !publish_end) {
+        return res.status(400).json({
+          message: "publish_start and publish_end required"
+        });
+      }
+
+      await pool.query(
+        `
+        UPDATE tests
+        SET
+          published = 1,
+          publish_start = ?,
+          publish_end = ?
+        WHERE test_id = ?
+        `,
+        [publish_start, publish_end, testId]
+      );
+
+
+      res.json({
+        success: true,
+        message: "Test published successfully"
+      });
+
+    } catch (err) {
+      console.error("Publish test error:", err);
+      res.status(500).json({ message: "Server error" });
+    }
+  }
+);
+
 
 
 app.get(
-  "/api/placement-training/student/courses",
+  "/api/placement-training/tests/:testId/questions",
   authenticateToken,
-  authorize(["student"]),
+  authorize(["Staff", "CA", "trainer", "HOD", "Principal"]),
   async (req, res) => {
     try {
-      const rollNo = req.user.roll_no;
-
-      const [[student]] = await pool.query(
-        "SELECT student_id FROM students WHERE roll_no = ?",
-        [rollNo]
-      );
-
-      if (!student) {
-        return res.status(404).json({ message: "Student not found" });
-      }
+      const { testId } = req.params;
 
       const [rows] = await pool.query(
         `
-        SELECT 
-          tc.course_id,
-          tc.name,
-          tc.description,
-          tc.start_date,
-          tc.end_date,
-          tc.status,
-
-          -- Test info
-          t.test_id,
-          t.published,
-
-          -- Attempt info
-          ta.attempt_id,
-          ta.score,
-          ta.pass_status,
-          ta.submitted_at
-
-        FROM training_enrollments te
-        JOIN training_courses tc ON te.course_id = tc.course_id
-        LEFT JOIN tests t ON t.course_id = tc.course_id AND t.published = 1
-        LEFT JOIN test_attempts ta 
-          ON ta.test_id = t.test_id 
-         AND ta.student_id = ?
-
-        WHERE te.student_id = ?
-        ORDER BY tc.start_date DESC
+        SELECT
+          question_id,
+          question,
+          option_a,
+          option_b,
+          option_c,
+          option_d,
+          correct_option,
+          marks
+        FROM questions
+        WHERE test_id = ?
+        ORDER BY question_id
         `,
-        [student.student_id, student.student_id]
+        [testId]
       );
 
       res.json({
         success: true,
-        courses: rows
+        questions: rows
       });
 
     } catch (err) {
-      console.error("Student courses error:", err);
+      console.error("Fetch questions error:", err);
       res.status(500).json({ message: "Server error" });
     }
   }
 );
+
+
 app.post(
   "/api/placement-training/student/tests/:testId/start",
   authenticateToken,
@@ -3630,14 +3766,28 @@ app.post(
       const rollNo = req.user.roll_no;
 
       const [[student]] = await pool.query(
-        "SELECT student_id FROM students WHERE roll_no = ?",
+        "SELECT student_id, dept_id, class_id FROM students WHERE roll_no = ?",
         [rollNo]
       );
 
+
       const [[test]] = await pool.query(
-        "SELECT max_attempts FROM tests WHERE test_id = ? AND published = 1",
-        [testId]
+        `
+  SELECT t.max_attempts, t.duration_minutes
+  FROM tests t
+  JOIN training_courses tc ON t.course_id = tc.course_id
+  JOIN training_course_assignments tca
+    ON tca.course_id = tc.course_id
+  WHERE
+    t.test_id = ?
+    AND t.published = 1
+    AND NOW() BETWEEN t.publish_start AND t.publish_end
+    AND tca.dept_id = ?
+    AND tca.class_id = ?
+  `,
+        [testId, student.dept_id, student.class_id]
       );
+
 
       if (!test) {
         return res.status(404).json({ message: "Test not available" });
@@ -3777,6 +3927,168 @@ app.post(
     }
   }
 );
+
+app.get(
+  "/api/placement-training/analytics",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const { role, class_id, dept_id, user_id } = req.user;
+
+      let filter = "WHERE a.status = 'SUBMITTED'";
+      const params = [];
+
+      if (role === "trainer") {
+        filter += " AND c.trainer_id = ?";
+        params.push(user_id);
+      }
+
+      else if (role === "CA") {
+        filter += " AND s.class_id = ?";
+        params.push(class_id);
+      }
+
+      else if (role === "HOD") {
+        filter += " AND s.dept_id = ?";
+        params.push(dept_id);
+      }
+
+      // ---------------- SUMMARY ----------------
+      const [[summary]] = await pool.query(
+        `
+        SELECT
+          COUNT(DISTINCT s.student_id) AS total_students,
+          COUNT(DISTINCT t.test_id)    AS total_tests,
+          COUNT(a.attempt_id)          AS total_attempts,
+          ROUND(
+            SUM(a.pass_status = 'pass') / COUNT(a.attempt_id) * 100,
+            2
+          ) AS pass_percentage
+        FROM test_attempts a
+        JOIN tests t ON t.test_id = a.test_id
+        JOIN training_courses c ON c.course_id = t.course_id
+        JOIN students s ON s.student_id = a.student_id
+        ${filter}
+        `,
+        params
+      );
+
+      // ---------------- TEST WISE ----------------
+      const [testWise] = await pool.query(
+        `
+        SELECT
+          t.test_id,
+          t.title,
+          COUNT(a.attempt_id) AS attempts,
+          ROUND(
+            SUM(a.pass_status = 'pass') / COUNT(a.attempt_id) * 100,
+            2
+          ) AS pass_percentage
+        FROM test_attempts a
+        JOIN tests t ON t.test_id = a.test_id
+        JOIN training_courses c ON c.course_id = t.course_id
+        JOIN students s ON s.student_id = a.student_id
+        ${filter}
+        GROUP BY t.test_id
+        ORDER BY attempts DESC
+        `,
+        params
+      );
+
+      // ---------------- DEPT WISE ----------------
+      const [deptWise] = await pool.query(
+        `
+        SELECT
+          s.dept_id,
+          COUNT(a.attempt_id) AS attempts,
+          ROUND(
+            SUM(a.pass_status = 'pass') / COUNT(a.attempt_id) * 100,
+            2
+          ) AS pass_percentage
+        FROM test_attempts a
+        JOIN students s ON s.student_id = a.student_id
+        ${filter}
+        GROUP BY s.dept_id
+        `,
+        params
+      );
+
+      res.json({
+        summary,
+        test_wise: testWise,
+        dept_wise: deptWise
+      });
+
+    } catch (err) {
+      console.error("Analytics API error:", err);
+      res.status(500).json({ message: "Server error" });
+    }
+  }
+);
+
+
+app.get(
+  "/api/placement-training/results",
+  authenticateToken,
+  async (req, res) => {
+    try {
+      const { role, student_id, class_id, dept_id, user_id } = req.user;
+
+      let where = "WHERE a.status = 'SUBMITTED'";
+      const params = [];
+
+      if (role === "student") {
+        where += " AND a.student_id = ?";
+        params.push(student_id);
+      }
+
+      else if (role === "trainer") {
+        where += " AND c.trainer_id = ?";
+        params.push(user_id);
+      }
+
+      else if (role === "CA") {
+        where += " AND s.class_id = ?";
+        params.push(class_id);
+      }
+
+      else if (role === "HOD") {
+        where += " AND s.dept_id = ?";
+        params.push(dept_id);
+      }
+
+      const [results] = await pool.query(
+        `
+        SELECT
+          c.name           AS course_name,
+          t.title          AS test_title,
+          s.roll_no,
+          a.attempt_no,
+          a.score,
+          a.percentage,
+          a.pass_status,
+          a.submitted_at
+        FROM test_attempts a
+        JOIN tests t ON t.test_id = a.test_id
+        JOIN training_courses c ON c.course_id = t.course_id
+        JOIN students s ON s.student_id = a.student_id
+        ${where}
+        ORDER BY a.submitted_at DESC
+        `,
+        params
+      );
+
+      res.json({ results });
+
+    } catch (err) {
+      console.error("Results API error:", err);
+      res.status(500).json({ message: "Server error" });
+    }
+  }
+);
+
+
+
 app.get(
   "/api/placement-training/student/results",
   authenticateToken,
@@ -3786,9 +4098,10 @@ app.get(
       const rollNo = req.user.roll_no;
 
       const [[student]] = await pool.query(
-        "SELECT student_id FROM students WHERE roll_no = ?",
+        "SELECT student_id, dept_id, class_id FROM students WHERE roll_no = ?",
         [rollNo]
       );
+
 
       const [rows] = await pool.query(
         `
@@ -3872,57 +4185,10 @@ app.post(
 
 
 
-app.post(
-  "/api/placement-training/courses",
-  authenticateToken,
-  authorize(["Staff", "CA", "trainer","HOD", "Principal"]),
-  async (req, res) => {
-    try {
-      const {
-        name,
-        description,
-        start_date,
-        end_date,
-        status
-      } = req.body;
-
-      if (!name || !start_date || !end_date) {
-        return res.status(400).json({ message: "Missing required fields" });
-      }
-
-      const [result] = await pool.query(
-        `
-        INSERT INTO training_courses
-          (name, description, trainer_id, start_date, end_date, status)
-        VALUES (?, ?, ?, ?, ?, ?)
-        `,
-        [
-          name,
-          description || null,
-          req.user.id,
-          start_date,
-          end_date,
-          status || "UPCOMING"
-        ]
-      );
-
-      res.json({
-        success: true,
-        course_id: result.insertId
-      });
-
-    } catch (err) {
-      console.error("Create course error:", err);
-      res.status(500).json({ message: "Server error" });
-    }
-  }
-);
-
-
 app.get(
   "/api/placement-training/courses",
   authenticateToken,
-  authorize(["Staff", "CA","trainer", "HOD", "Principal"]),
+  authorize(["Staff", "CA", "trainer", "HOD", "Principal"]),
   async (req, res) => {
     try {
       const [rows] = await pool.query(
@@ -3951,82 +4217,11 @@ app.get(
 );
 
 
-app.post(
-  "/api/placement-training/courses/:courseId/enroll",
-  authenticateToken,
-  authorize(["Staff", "CA", "trainer","HOD", "Principal"]),
-  async (req, res) => {
-    try {
-      const { courseId } = req.params;
-      const { student_ids } = req.body;
-
-      if (!Array.isArray(student_ids) || student_ids.length === 0) {
-        return res.status(400).json({ message: "Student list required" });
-      }
-
-      for (const studentId of student_ids) {
-        await pool.query(
-          `
-          INSERT IGNORE INTO training_enrollments
-            (course_id, student_id)
-          VALUES (?, ?)
-          `,
-          [courseId, studentId]
-        );
-      }
-
-      res.json({
-        success: true,
-        enrolled_count: student_ids.length
-      });
-
-    } catch (err) {
-      console.error("Enroll students error:", err);
-      res.status(500).json({ message: "Server error" });
-    }
-  }
-);
-
-
-app.get(
-  "/api/placement-training/courses/:courseId/students",
-  authenticateToken,
-  authorize(["Staff", "CA", "trainer","HOD", "Principal"]),
-  async (req, res) => {
-    try {
-      const { courseId } = req.params;
-
-      const [rows] = await pool.query(
-        `
-        SELECT 
-          s.student_id,
-          s.roll_no,
-          s.name,
-          s.email,
-          s.class_id,
-          s.dept_id
-        FROM training_enrollments te
-        JOIN students s ON te.student_id = s.student_id
-        WHERE te.course_id = ?
-        ORDER BY s.roll_no
-        `,
-        [courseId]
-      );
-
-      res.json({ success: true, students: rows });
-
-    } catch (err) {
-      console.error("Fetch enrolled students error:", err);
-      res.status(500).json({ message: "Server error" });
-    }
-  }
-);
-
 
 app.post(
   "/api/placement-training/tests",
   authenticateToken,
-  authorize(["Staff", "CA","trainer", "HOD", "Principal"]),
+  authorize(["Staff", "CA", "trainer", "HOD", "Principal"]),
   async (req, res) => {
     try {
       const {
@@ -4075,7 +4270,7 @@ app.post(
 app.post(
   "/api/placement-training/tests/:testId/questions",
   authenticateToken,
-  authorize(["Staff", "CA", "HOD", "trainer","Principal"]),
+  authorize(["Staff", "CA", "HOD", "trainer", "Principal"]),
   async (req, res) => {
     try {
       const { testId } = req.params;
@@ -4117,11 +4312,127 @@ app.post(
   }
 );
 
+app.post(
+  "/api/placement-training/tests/:testId/assign",
+  authenticateToken,
+  authorize(["trainer", "HOD", "Principal"]),
+  async (req, res) => {
+    try {
+      const { testId } = req.params;
+      const { assignments } = req.body;
+
+      if (!Array.isArray(assignments) || assignments.length === 0) {
+        return res.status(400).json({ message: "Assignments required" });
+      }
+
+      for (const a of assignments) {
+        await pool.query(
+          `
+          INSERT IGNORE INTO training_test_assignments
+            (test_id, dept_id, class_id)
+          VALUES (?, ?, ?)
+          `,
+          [testId, a.dept_id, a.class_id]
+        );
+      }
+
+      res.json({ success: true });
+    } catch (err) {
+      console.error("Assign test error:", err);
+      res.status(500).json({ message: "Server error" });
+    }
+  }
+);
+app.get(
+  "/api/placement-training/courses/:courseId/assignments",
+  authenticateToken,
+  authorize(["trainer", "HOD", "Principal"]),
+  async (req, res) => {
+    try {
+      const { courseId } = req.params;
+
+      const [rows] = await pool.query(
+        `
+        SELECT dept_id, class_id
+        FROM training_course_assignments
+        WHERE course_id = ?
+        ORDER BY dept_id, class_id
+        `,
+        [courseId]
+      );
+
+      res.json({ assignments: rows });
+    } catch (err) {
+      console.error("Get course assignments error:", err);
+      res.status(500).json({ message: "Server error" });
+    }
+  }
+);
+
+app.get(
+  "/api/placement-training/tests/:testId/assignments",
+  authenticateToken,
+  authorize(["trainer", "HOD", "Principal"]),
+  async (req, res) => {
+    try {
+      const { testId } = req.params;
+
+      const [rows] = await pool.query(
+        `
+        SELECT dept_id, class_id
+        FROM training_test_assignments
+        WHERE test_id = ?
+        ORDER BY dept_id, class_id
+        `,
+        [testId]
+      );
+
+      res.json({ assignments: rows });
+    } catch (err) {
+      console.error("Get test assignments error:", err);
+      res.status(500).json({ message: "Server error" });
+    }
+  }
+);
+
+app.patch(
+  "/api/placement-training/tests/:testId/publish",
+  authenticateToken,
+  authorize(["trainer", "HOD", "Principal"]),
+  async (req, res) => {
+    const { testId } = req.params;
+
+    // check assignment exists
+    const [[assign]] = await pool.query(
+      `SELECT COUNT(*) cnt FROM training_test_assignments WHERE test_id = ?`,
+      [testId]
+    );
+
+    if (assign.cnt === 0) {
+      return res.status(400).json({
+        message: "Assign test before publishing"
+      });
+    }
+
+    await pool.query(
+      `
+      UPDATE tests
+      SET published = IF(published = 1, 0, 1)
+      WHERE test_id = ?
+      `,
+      [testId]
+    );
+
+    res.json({ success: true });
+  }
+);
+
+
 
 app.get(
   "/api/placement-training/tests/:testId/results",
   authenticateToken,
-  authorize(["Staff", "CA", "HOD","trainer", "Principal"]),
+  authorize(["Staff", "CA", "HOD", "trainer", "Principal"]),
   async (req, res) => {
     try {
       const { testId } = req.params;
@@ -4160,23 +4471,29 @@ app.get(
 app.get(
   "/api/placement-training/courses/:courseId/analytics",
   authenticateToken,
-  authorize(["Staff", "CA", "HOD","trainer", "Principal"]),
+  authorize(["Staff", "CA", "HOD", "trainer", "Principal"]),
   async (req, res) => {
     try {
       const { courseId } = req.params;
 
       const [[stats]] = await pool.query(
         `
-        SELECT
-          COUNT(DISTINCT te.student_id) AS enrolled,
+                SELECT
+          COUNT(DISTINCT s.student_id) AS eligible_students,
           COUNT(DISTINCT ta.student_id) AS attempted,
           SUM(ta.pass_status = 'pass') AS passed,
           SUM(ta.pass_status = 'fail') AS failed,
           ROUND(AVG(ta.percentage), 2) AS avg_percentage
-        FROM training_enrollments te
-        LEFT JOIN tests t ON t.course_id = te.course_id
-        LEFT JOIN test_attempts ta ON ta.test_id = t.test_id
-        WHERE te.course_id = ?
+        FROM training_course_assignments ca
+        JOIN students s
+          ON s.dept_id = ca.dept_id
+        AND s.class_id = ca.class_id
+        LEFT JOIN tests t
+          ON t.course_id = ca.course_id
+        LEFT JOIN test_attempts ta
+          ON ta.test_id = t.test_id
+        WHERE ca.course_id = ?
+
         `,
         [courseId]
       );
@@ -4193,7 +4510,216 @@ app.get(
   }
 );
 
+app.post(
+  "/api/placement-training/courses/:courseId/assign",
+  authenticateToken,
+  authorize(["trainer", "HOD", "Principal"]),
+  async (req, res) => {
+    try {
+      const { courseId } = req.params;
+      const { assignments } = req.body;
 
+      if (!Array.isArray(assignments) || assignments.length === 0) {
+        return res.status(400).json({ message: "Assignments required" });
+      }
+
+      for (const a of assignments) {
+        await pool.query(
+          `
+          INSERT IGNORE INTO training_course_assignments
+            (course_id, dept_id, class_id)
+          VALUES (?, ?, ?)
+          `,
+          [courseId, a.dept_id, a.class_id]
+        );
+      }
+
+      res.json({
+        success: true,
+        assigned_count: assignments.length
+      });
+    } catch (err) {
+      console.error("Assign course error:", err);
+      res.status(500).json({ message: "Server error" });
+    }
+  }
+);
+
+
+app.get(
+  "/api/placement-training/courses/:courseId/assignments",
+  authenticateToken,
+  authorize(["trainer", "HOD", "CA", "Principal"]),
+  async (req, res) => {
+    try {
+      const { courseId } = req.params;
+
+      const [rows] = await pool.query(
+        `
+        SELECT
+          id,
+          dept_id,
+          class_id
+        FROM training_course_assignments
+        WHERE course_id = ?
+        ORDER BY dept_id, class_id
+        `,
+        [courseId]
+      );
+
+      res.json({ success: true, assignments: rows });
+    } catch (err) {
+      console.error("Fetch course assignments error:", err);
+      res.status(500).json({ message: "Server error" });
+    }
+  }
+);
+
+
+app.delete(
+  "/api/placement-training/course-assignments/:id",
+  authenticateToken,
+  authorize(["trainer", "HOD", "Principal"]),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+
+      await pool.query(
+        `
+        DELETE FROM training_course_assignments
+        WHERE id = ?
+        `,
+        [id]
+      );
+
+      res.json({ success: true });
+    } catch (err) {
+      console.error("Delete course assignment error:", err);
+      res.status(500).json({ message: "Server error" });
+    }
+  }
+);
+
+
+app.put(
+  "/api/placement-training/courses/:courseId/assignments",
+  authenticateToken,
+  authorize(["trainer", "HOD", "Principal"]),
+  async (req, res) => {
+    try {
+      const { courseId } = req.params;
+      const { assignments } = req.body;
+
+      if (!Array.isArray(assignments)) {
+        return res.status(400).json({ message: "Assignments array required" });
+      }
+
+      await pool.query(
+        `DELETE FROM training_course_assignments WHERE course_id = ?`,
+        [courseId]
+      );
+
+      for (const a of assignments) {
+        await pool.query(
+          `
+          INSERT INTO training_course_assignments
+            (course_id, dept_id, class_id)
+          VALUES (?, ?, ?)
+          `,
+          [courseId, a.dept_id, a.class_id]
+        );
+      }
+
+      res.json({ success: true });
+    } catch (err) {
+      console.error("Replace assignments error:", err);
+      res.status(500).json({ message: "Server error" });
+    }
+  }
+);
+
+
+const isStudentEligibleForCourse = async (student, courseId) => {
+  const [[row]] = await pool.query(
+    `
+    SELECT 1
+    FROM training_course_assignments
+    WHERE course_id = ?
+      AND dept_id = ?
+      AND class_id = ?
+    `,
+    [courseId, student.dept_id, student.class_id]
+  );
+  return !!row;
+};
+
+
+app.get(
+  "/api/placement-training/student/courses/:courseId/tests",
+  authenticateToken,
+  authorize(["student"]),
+  async (req, res) => {
+    try {
+      const { courseId } = req.params;
+      const rollNo = req.user.roll_no;
+
+      const [[student]] = await pool.query(
+        "SELECT dept_id, class_id FROM students WHERE roll_no = ?",
+        [rollNo]
+      );
+
+      const [tests] = await pool.query(
+        `
+  SELECT
+    t.test_id,
+    t.title,
+    t.duration_minutes,
+    t.publish_start,
+    t.publish_end
+  FROM tests t
+  JOIN training_course_assignments tca
+    ON tca.course_id = t.course_id
+  WHERE
+    t.course_id = ?
+    AND t.published = 1
+    AND NOW() BETWEEN t.publish_start AND t.publish_end
+    AND tca.dept_id = ?
+    AND tca.class_id = ?
+  ORDER BY t.publish_start ASC
+  `,
+        [courseId, student.dept_id, student.class_id]
+      );
+
+
+      res.json({ success: true, tests });
+    } catch (err) {
+      console.error(err);
+      res.status(500).json({ message: "Server error" });
+    }
+  }
+);
+
+
+app.patch(
+  "/api/placement-training/tests/:testId/publish-window",
+  authenticateToken,
+  authorize(["trainer", "HOD", "Principal"]),
+  async (req, res) => {
+    const { testId } = req.params;
+    const { publish_start, publish_end } = req.body;
+
+    await pool.query(
+      `
+      UPDATE tests
+      SET publish_start = ?, publish_end = ?
+      WHERE test_id = ?
+      `,
+      [publish_start, publish_end, testId]
+    );
+
+    res.json({ success: true });
+  }
+);
 
 
 // =======================
