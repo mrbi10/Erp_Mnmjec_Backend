@@ -392,6 +392,15 @@ app.get('/api/students', authenticateToken, async (req, res) => {
         params = [req.user.dept_id];
         break;
 
+      case 'principal':
+        query = `
+          SELECT * 
+          FROM students
+          ORDER BY roll_no ASC
+        `;
+        params = [req.user.dept_id];
+        break;
+
       default:
         query = `
           SELECT * 
