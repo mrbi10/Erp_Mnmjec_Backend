@@ -3493,6 +3493,705 @@ app.get('/api/mess/range', authenticateToken, authorize(['Principal', 'HOD', 'Me
 //     res.status(500).json({ message: "Server error" });
 //   }
 // });
+////////////////////placement////////////
+
+
+app.get(
+  "/api/placement-training/student/courses",
+  authenticateToken,
+  authorize(["student"]),
+  async (req, res) => {
+    try {
+      const rollNo = req.user.roll_no;
+
+      const [[student]] = await pool.query(
+        "SELECT student_id FROM students WHERE roll_no = ?",
+        [rollNo]
+      );
+
+      if (!student) {
+        return res.status(404).json({ message: "Student not found" });
+      }
+
+      const [rows] = await pool.query(
+        `
+        SELECT 
+          tc.course_id,
+          tc.name,
+          tc.description,
+          tc.start_date,
+          tc.end_date,
+          tc.status,
+
+          -- Test info
+          t.test_id,
+          t.published,
+
+          -- Attempt info
+          ta.attempt_id,
+          ta.score,
+          ta.pass_status,
+          ta.submitted_at
+
+        FROM training_enrollments te
+        JOIN training_courses tc ON te.course_id = tc.course_id
+        LEFT JOIN tests t ON t.course_id = tc.course_id AND t.published = 1
+        LEFT JOIN test_attempts ta 
+          ON ta.test_id = t.test_id 
+         AND ta.student_id = ?
+
+        WHERE te.student_id = ?
+        ORDER BY tc.start_date DESC
+        `,
+        [student.student_id, student.student_id]
+      );
+
+      res.json({
+        success: true,
+        courses: rows
+      });
+
+    } catch (err) {
+      console.error("Student courses error:", err);
+      res.status(500).json({ message: "Server error" });
+    }
+  }
+);
+
+
+app.get(
+  "/api/placement-training/student/courses",
+  authenticateToken,
+  authorize(["student"]),
+  async (req, res) => {
+    try {
+      const rollNo = req.user.roll_no;
+
+      const [[student]] = await pool.query(
+        "SELECT student_id FROM students WHERE roll_no = ?",
+        [rollNo]
+      );
+
+      if (!student) {
+        return res.status(404).json({ message: "Student not found" });
+      }
+
+      const [rows] = await pool.query(
+        `
+        SELECT 
+          tc.course_id,
+          tc.name,
+          tc.description,
+          tc.start_date,
+          tc.end_date,
+          tc.status,
+
+          -- Test info
+          t.test_id,
+          t.published,
+
+          -- Attempt info
+          ta.attempt_id,
+          ta.score,
+          ta.pass_status,
+          ta.submitted_at
+
+        FROM training_enrollments te
+        JOIN training_courses tc ON te.course_id = tc.course_id
+        LEFT JOIN tests t ON t.course_id = tc.course_id AND t.published = 1
+        LEFT JOIN test_attempts ta 
+          ON ta.test_id = t.test_id 
+         AND ta.student_id = ?
+
+        WHERE te.student_id = ?
+        ORDER BY tc.start_date DESC
+        `,
+        [student.student_id, student.student_id]
+      );
+
+      res.json({
+        success: true,
+        courses: rows
+      });
+
+    } catch (err) {
+      console.error("Student courses error:", err);
+      res.status(500).json({ message: "Server error" });
+    }
+  }
+);
+app.post(
+  "/api/placement-training/student/tests/:testId/start",
+  authenticateToken,
+  authorize(["student"]),
+  async (req, res) => {
+    try {
+      const { testId } = req.params;
+      const rollNo = req.user.roll_no;
+
+      const [[student]] = await pool.query(
+        "SELECT student_id FROM students WHERE roll_no = ?",
+        [rollNo]
+      );
+
+      const [[test]] = await pool.query(
+        "SELECT max_attempts FROM tests WHERE test_id = ? AND published = 1",
+        [testId]
+      );
+
+      if (!test) {
+        return res.status(404).json({ message: "Test not available" });
+      }
+
+      const [[attemptCount]] = await pool.query(
+        `
+        SELECT COUNT(*) AS total
+        FROM test_attempts
+        WHERE test_id = ? AND student_id = ?
+        `,
+        [testId, student.student_id]
+      );
+
+      if (attemptCount.total >= test.max_attempts) {
+        return res.status(400).json({ message: "Max attempts reached" });
+      }
+
+      const [result] = await pool.query(
+        `
+        INSERT INTO test_attempts
+          (test_id, student_id, attempt_no, started_at)
+        VALUES (?, ?, ?, NOW())
+        `,
+        [testId, student.student_id, attemptCount.total + 1]
+      );
+
+      // Fetch questions (send without correct answers)
+      const [questions] = await pool.query(
+        `
+        SELECT 
+          question_id,
+          question,
+          option_a,
+          option_b,
+          option_c,
+          option_d,
+          marks
+        FROM questions
+        WHERE test_id = ?
+        `,
+        [testId]
+      );
+
+      res.json({
+        success: true,
+        attempt_id: result.insertId,
+        questions
+      });
+
+    } catch (err) {
+      console.error("Start test error:", err);
+      res.status(500).json({ message: "Server error" });
+    }
+  }
+);
+
+
+app.post(
+  "/api/placement-training/student/tests/:testId/submit",
+  authenticateToken,
+  authorize(["student"]),
+  async (req, res) => {
+    const { testId } = req.params;
+    const { attempt_id, answers } = req.body;
+
+    if (!attempt_id || !Array.isArray(answers)) {
+      return res.status(400).json({ message: "Invalid payload" });
+    }
+
+    let conn;
+    try {
+      conn = await pool.getConnection();
+      await conn.beginTransaction();
+
+      let totalScore = 0;
+
+      for (const ans of answers) {
+        const { question_id, selected_option } = ans;
+
+        const [[q]] = await conn.query(
+          `
+          SELECT correct_option, marks
+          FROM questions
+          WHERE question_id = ? AND test_id = ?
+          `,
+          [question_id, testId]
+        );
+
+        if (!q) continue;
+
+        const isCorrect = q.correct_option === selected_option;
+        if (isCorrect) totalScore += q.marks;
+
+        await conn.query(
+          `
+          INSERT INTO student_answers
+            (attempt_id, question_id, selected_option, is_correct)
+          VALUES (?, ?, ?, ?)
+          `,
+          [attempt_id, question_id, selected_option, isCorrect ? 1 : 0]
+        );
+      }
+
+      const [[test]] = await conn.query(
+        "SELECT pass_mark, total_marks FROM tests WHERE test_id = ?",
+        [testId]
+      );
+
+      const percentage = (totalScore / test.total_marks) * 100;
+      const passStatus = totalScore >= test.pass_mark ? "pass" : "fail";
+
+      await conn.query(
+        `
+        UPDATE test_attempts
+        SET score = ?, percentage = ?, pass_status = ?, submitted_at = NOW()
+        WHERE attempt_id = ?
+        `,
+        [totalScore, percentage, passStatus, attempt_id]
+      );
+
+      await conn.commit();
+
+      res.json({
+        success: true,
+        score: totalScore,
+        percentage,
+        pass_status: passStatus
+      });
+
+    } catch (err) {
+      if (conn) await conn.rollback();
+      console.error("Submit test error:", err);
+      res.status(500).json({ message: "Server error" });
+    } finally {
+      if (conn) conn.release();
+    }
+  }
+);
+app.get(
+  "/api/placement-training/student/results",
+  authenticateToken,
+  authorize(["student"]),
+  async (req, res) => {
+    try {
+      const rollNo = req.user.roll_no;
+
+      const [[student]] = await pool.query(
+        "SELECT student_id FROM students WHERE roll_no = ?",
+        [rollNo]
+      );
+
+      const [rows] = await pool.query(
+        `
+        SELECT 
+          tc.name AS course_name,
+          t.title AS test_title,
+          ta.attempt_no,
+          ta.score,
+          ta.percentage,
+          ta.pass_status,
+          ta.submitted_at
+        FROM test_attempts ta
+        JOIN tests t ON ta.test_id = t.test_id
+        JOIN training_courses tc ON t.course_id = tc.course_id
+        WHERE ta.student_id = ?
+        ORDER BY ta.submitted_at DESC
+        `,
+        [student.student_id]
+      );
+
+      res.json({
+        success: true,
+        results: rows
+      });
+
+    } catch (err) {
+      console.error("Student results error:", err);
+      res.status(500).json({ message: "Server error" });
+    }
+  }
+);
+
+
+// ===== Placement Training – Trainer =====
+
+app.post(
+  "/api/placement-training/courses",
+  authenticateToken,
+  authorize(["Staff", "CA", "trainer", "HOD", "Principal"]),
+  async (req, res) => {
+    try {
+      const {
+        name,
+        description,
+        start_date,
+        end_date,
+        status
+      } = req.body;
+
+      if (!name || !start_date || !end_date) {
+        return res.status(400).json({ message: "Missing required fields" });
+      }
+
+      const [result] = await pool.query(
+        `
+        INSERT INTO training_courses
+          (name, description, trainer_id, start_date, end_date, status)
+        VALUES (?, ?, ?, ?, ?, ?)
+        `,
+        [
+          name,
+          description || null,
+          req.user.id,
+          start_date,
+          end_date,
+          status || "UPCOMING"
+        ]
+      );
+
+      res.json({
+        success: true,
+        course_id: result.insertId
+      });
+
+    } catch (err) {
+      console.error("Create course error:", err);
+      res.status(500).json({ message: "Server error" });
+    }
+  }
+);
+
+
+
+app.post(
+  "/api/placement-training/courses",
+  authenticateToken,
+  authorize(["Staff", "CA", "trainer","HOD", "Principal"]),
+  async (req, res) => {
+    try {
+      const {
+        name,
+        description,
+        start_date,
+        end_date,
+        status
+      } = req.body;
+
+      if (!name || !start_date || !end_date) {
+        return res.status(400).json({ message: "Missing required fields" });
+      }
+
+      const [result] = await pool.query(
+        `
+        INSERT INTO training_courses
+          (name, description, trainer_id, start_date, end_date, status)
+        VALUES (?, ?, ?, ?, ?, ?)
+        `,
+        [
+          name,
+          description || null,
+          req.user.id,
+          start_date,
+          end_date,
+          status || "UPCOMING"
+        ]
+      );
+
+      res.json({
+        success: true,
+        course_id: result.insertId
+      });
+
+    } catch (err) {
+      console.error("Create course error:", err);
+      res.status(500).json({ message: "Server error" });
+    }
+  }
+);
+
+
+app.get(
+  "/api/placement-training/courses",
+  authenticateToken,
+  authorize(["Staff", "CA","trainer", "HOD", "Principal"]),
+  async (req, res) => {
+    try {
+      const [rows] = await pool.query(
+        `
+        SELECT 
+          course_id,
+          name,
+          description,
+          start_date,
+          end_date,
+          status
+        FROM training_courses
+        WHERE trainer_id = ?
+        ORDER BY start_date DESC
+        `,
+        [req.user.id]
+      );
+
+      res.json({ success: true, courses: rows });
+
+    } catch (err) {
+      console.error("Fetch courses error:", err);
+      res.status(500).json({ message: "Server error" });
+    }
+  }
+);
+
+
+app.post(
+  "/api/placement-training/courses/:courseId/enroll",
+  authenticateToken,
+  authorize(["Staff", "CA", "trainer","HOD", "Principal"]),
+  async (req, res) => {
+    try {
+      const { courseId } = req.params;
+      const { student_ids } = req.body;
+
+      if (!Array.isArray(student_ids) || student_ids.length === 0) {
+        return res.status(400).json({ message: "Student list required" });
+      }
+
+      for (const studentId of student_ids) {
+        await pool.query(
+          `
+          INSERT IGNORE INTO training_enrollments
+            (course_id, student_id)
+          VALUES (?, ?)
+          `,
+          [courseId, studentId]
+        );
+      }
+
+      res.json({
+        success: true,
+        enrolled_count: student_ids.length
+      });
+
+    } catch (err) {
+      console.error("Enroll students error:", err);
+      res.status(500).json({ message: "Server error" });
+    }
+  }
+);
+
+
+app.get(
+  "/api/placement-training/courses/:courseId/students",
+  authenticateToken,
+  authorize(["Staff", "CA", "trainer","HOD", "Principal"]),
+  async (req, res) => {
+    try {
+      const { courseId } = req.params;
+
+      const [rows] = await pool.query(
+        `
+        SELECT 
+          s.student_id,
+          s.roll_no,
+          s.name,
+          s.email,
+          s.class_id,
+          s.dept_id
+        FROM training_enrollments te
+        JOIN students s ON te.student_id = s.student_id
+        WHERE te.course_id = ?
+        ORDER BY s.roll_no
+        `,
+        [courseId]
+      );
+
+      res.json({ success: true, students: rows });
+
+    } catch (err) {
+      console.error("Fetch enrolled students error:", err);
+      res.status(500).json({ message: "Server error" });
+    }
+  }
+);
+
+
+app.post(
+  "/api/placement-training/tests",
+  authenticateToken,
+  authorize(["Staff", "CA","trainer", "HOD", "Principal"]),
+  async (req, res) => {
+    try {
+      const {
+        course_id,
+        title,
+        duration_minutes,
+        total_marks,
+        pass_mark,
+        max_attempts
+      } = req.body;
+
+      if (!course_id || !title || !duration_minutes) {
+        return res.status(400).json({ message: "Missing required fields" });
+      }
+
+      const [result] = await pool.query(
+        `
+        INSERT INTO tests
+          (course_id, title, duration_minutes, total_marks, pass_mark, max_attempts)
+        VALUES (?, ?, ?, ?, ?, ?)
+        `,
+        [
+          course_id,
+          title,
+          duration_minutes,
+          total_marks || 100,
+          pass_mark || 40,
+          max_attempts || 1
+        ]
+      );
+
+      res.json({
+        success: true,
+        test_id: result.insertId
+      });
+
+    } catch (err) {
+      console.error("Create test error:", err);
+      res.status(500).json({ message: "Server error" });
+    }
+  }
+);
+
+
+
+app.post(
+  "/api/placement-training/tests/:testId/questions",
+  authenticateToken,
+  authorize(["Staff", "CA", "HOD", "trainer","Principal"]),
+  async (req, res) => {
+    try {
+      const { testId } = req.params;
+      const { questions } = req.body;
+
+      if (!Array.isArray(questions) || questions.length === 0) {
+        return res.status(400).json({ message: "Questions required" });
+      }
+
+      for (const q of questions) {
+        await pool.query(
+          `
+          INSERT INTO questions
+            (test_id, question, option_a, option_b, option_c, option_d, correct_option, marks)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          `,
+          [
+            testId,
+            q.question,
+            q.option_a,
+            q.option_b,
+            q.option_c,
+            q.option_d,
+            q.correct_option,
+            q.marks || 1
+          ]
+        );
+      }
+
+      res.json({
+        success: true,
+        added: questions.length
+      });
+
+    } catch (err) {
+      console.error("Add questions error:", err);
+      res.status(500).json({ message: "Server error" });
+    }
+  }
+);
+
+
+app.get(
+  "/api/placement-training/tests/:testId/results",
+  authenticateToken,
+  authorize(["Staff", "CA", "HOD","trainer", "Principal"]),
+  async (req, res) => {
+    try {
+      const { testId } = req.params;
+
+      const [rows] = await pool.query(
+        `
+        SELECT 
+          s.roll_no,
+          s.name,
+          ta.attempt_no,
+          ta.score,
+          ta.percentage,
+          ta.pass_status,
+          ta.submitted_at
+        FROM test_attempts ta
+        JOIN students s ON ta.student_id = s.student_id
+        WHERE ta.test_id = ?
+        ORDER BY ta.submitted_at DESC
+        `,
+        [testId]
+      );
+
+      res.json({
+        success: true,
+        results: rows
+      });
+
+    } catch (err) {
+      console.error("Fetch test results error:", err);
+      res.status(500).json({ message: "Server error" });
+    }
+  }
+);
+
+
+app.get(
+  "/api/placement-training/courses/:courseId/analytics",
+  authenticateToken,
+  authorize(["Staff", "CA", "HOD","trainer", "Principal"]),
+  async (req, res) => {
+    try {
+      const { courseId } = req.params;
+
+      const [[stats]] = await pool.query(
+        `
+        SELECT
+          COUNT(DISTINCT te.student_id) AS enrolled,
+          COUNT(DISTINCT ta.student_id) AS attempted,
+          SUM(ta.pass_status = 'pass') AS passed,
+          SUM(ta.pass_status = 'fail') AS failed,
+          ROUND(AVG(ta.percentage), 2) AS avg_percentage
+        FROM training_enrollments te
+        LEFT JOIN tests t ON t.course_id = te.course_id
+        LEFT JOIN test_attempts ta ON ta.test_id = t.test_id
+        WHERE te.course_id = ?
+        `,
+        [courseId]
+      );
+
+      res.json({
+        success: true,
+        analytics: stats
+      });
+
+    } catch (err) {
+      console.error("Course analytics error:", err);
+      res.status(500).json({ message: "Server error" });
+    }
+  }
+);
 
 
 
