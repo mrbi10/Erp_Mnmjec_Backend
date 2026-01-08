@@ -3518,8 +3518,6 @@ app.get(
   tc.course_id,
   tc.name,
   tc.description,
-  tc.start_date,
-  tc.end_date,
   tc.status
 FROM training_courses tc
 JOIN training_course_assignments ca
@@ -3527,7 +3525,7 @@ JOIN training_course_assignments ca
 WHERE
   ca.dept_id = ?
   AND ca.class_id = ?
-ORDER BY tc.start_date DESC
+ORDER BY tc.course_id DESC
 
         `,
         [student.dept_id, student.class_id]
@@ -3562,6 +3560,8 @@ app.get(
           total_marks,
           pass_mark,
           max_attempts,
+          publish_start,
+          publish_end,
           published,
           created_at
         FROM tests
@@ -3649,71 +3649,8 @@ app.patch(
 );
 
 
-app.patch(
-  "/api/placement-training/tests/:testId/publish",
-  authenticateToken,
-  authorize(["trainer"]),
-  async (req, res) => {
-    try {
-      const { testId } = req.params;
-      const trainerId = req.user.id;
-
-      // Ensure test belongs to trainer (via course)
-      const [[test]] = await pool.query(
-        `
-        SELECT t.test_id, t.published
-        FROM tests t
-        JOIN training_courses c ON t.course_id = c.course_id
-        WHERE t.test_id = ? AND c.trainer_id = ?
-        `,
-        [testId, trainerId]
-      );
-
-      if (!test) {
-        return res.status(404).json({
-          message: "Test not found or access denied"
-        });
-      }
-
-      if (test.published === 1) {
-        return res.json({
-          success: true,
-          message: "Test already published"
-        });
-      }
-
-      const { publish_start, publish_end } = req.body;
-
-      if (!publish_start || !publish_end) {
-        return res.status(400).json({
-          message: "publish_start and publish_end required"
-        });
-      }
-
-      await pool.query(
-        `
-        UPDATE tests
-        SET
-          published = 1,
-          publish_start = ?,
-          publish_end = ?
-        WHERE test_id = ?
-        `,
-        [publish_start, publish_end, testId]
-      );
 
 
-      res.json({
-        success: true,
-        message: "Test published successfully"
-      });
-
-    } catch (err) {
-      console.error("Publish test error:", err);
-      res.status(500).json({ message: "Server error" });
-    }
-  }
-);
 
 
 
@@ -3834,6 +3771,7 @@ app.post(
 
       res.json({
         success: true,
+        test,
         attempt_id: result.insertId,
         questions
       });
@@ -3903,7 +3841,7 @@ app.post(
       await conn.query(
         `
         UPDATE test_attempts
-        SET score = ?, percentage = ?, pass_status = ?, submitted_at = NOW()
+        SET score = ?, percentage = ?, pass_status = ?, submitted_at = NOW(),status = 'SUBMITTED'
         WHERE attempt_id = ?
         `,
         [totalScore, percentage, passStatus, attempt_id]
@@ -4143,30 +4081,23 @@ app.post(
   authorize(["Staff", "CA", "trainer", "HOD", "Principal"]),
   async (req, res) => {
     try {
-      const {
-        name,
-        description,
-        start_date,
-        end_date,
-        status
-      } = req.body;
+      const { name, description, status } = req.body;
 
-      if (!name || !start_date || !end_date) {
-        return res.status(400).json({ message: "Missing required fields" });
+      if (!name) {
+        return res.status(400).json({ message: "Course name required" });
       }
 
       const [result] = await pool.query(
         `
-        INSERT INTO training_courses
-          (name, description, trainer_id, start_date, end_date, status)
-        VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO training_courses
+  (name, description, trainer_id, status)
+VALUES (?, ?, ?, ?)
+
         `,
         [
           name,
           description || null,
           req.user.id,
-          start_date,
-          end_date,
           status || "UPCOMING"
         ]
       );
@@ -4196,13 +4127,11 @@ app.get(
         SELECT 
           course_id,
           name,
-          description,
-          start_date,
-          end_date,
+          description,          
           status
         FROM training_courses
         WHERE trainer_id = ?
-        ORDER BY start_date DESC
+        ORDER BY course_id DESC
         `,
         [req.user.id]
       );
@@ -4315,34 +4244,193 @@ app.post(
 app.post(
   "/api/placement-training/tests/:testId/assign",
   authenticateToken,
-  authorize(["trainer", "HOD", "Principal"]),
+  authorize(["trainer"]),
   async (req, res) => {
     try {
       const { testId } = req.params;
-      const { assignments } = req.body;
+      const { assignments, publish_start, publish_end , published} = req.body;
 
-      if (!Array.isArray(assignments) || assignments.length === 0) {
+      if (!assignments || assignments.length === 0) {
         return res.status(400).json({ message: "Assignments required" });
       }
 
-      for (const a of assignments) {
-        await pool.query(
-          `
-          INSERT IGNORE INTO training_test_assignments
-            (test_id, dept_id, class_id)
-          VALUES (?, ?, ?)
-          `,
-          [testId, a.dept_id, a.class_id]
-        );
+      if (!publish_start || !publish_end) {
+        return res.status(400).json({
+          message: "publish_start and publish_end are required"
+        });
       }
 
-      res.json({ success: true });
+      // 1️⃣ Clear existing assignments
+      await pool.query(
+        `DELETE FROM training_test_assignments WHERE test_id = ?`,
+        [testId]
+      );
+
+      // 2️⃣ Insert new assignments
+      const values = assignments.map(a => [
+        testId,
+        a.dept_id,
+        a.class_id
+      ]);
+
+      await pool.query(
+        `
+        INSERT INTO training_test_assignments
+        (test_id, dept_id, class_id)
+        VALUES ?
+        `,
+        [values]
+      );
+
+      // ✅ 3️⃣ SAVE PUBLISH WINDOW INTO tests TABLE (THIS WAS MISSING)
+      await pool.query(
+        `
+        UPDATE tests
+        SET publish_start = ?, publish_end = ? , published = ?
+        WHERE test_id = ?
+        `,
+        [publish_start, publish_end, published, testId]
+      );
+
+      res.json({
+        success: true,
+        message: "Test assigned successfully"
+      });
+
     } catch (err) {
       console.error("Assign test error:", err);
       res.status(500).json({ message: "Server error" });
     }
   }
 );
+
+
+app.patch(
+  "/api/placement-training/courses/:courseId",
+  authenticateToken,
+  authorize(["trainer", "HOD", "Principal"]),
+  async (req, res) => {
+    try {
+      const { courseId } = req.params;
+      const { name, description } = req.body;
+
+      if (!name) {
+        return res.status(400).json({ message: "Course name required" });
+      }
+
+      await pool.query(
+        `
+        UPDATE training_courses
+        SET name = ?, description = ?
+        WHERE course_id = ?
+        `,
+        [name, description || null, courseId]
+      );
+
+      res.json({ success: true });
+    } catch (err) {
+      console.error("Update course error:", err);
+      res.status(500).json({ message: "Server error" });
+    }
+  }
+);
+
+
+app.delete(
+  "/api/placement-training/courses/:courseId",
+  authenticateToken,
+  authorize(["trainer", "HOD", "Principal"]),
+  async (req, res) => {
+    try {
+      const { courseId } = req.params;
+
+      // order matters
+      await pool.query(`DELETE FROM training_test_assignments WHERE test_id IN (
+        SELECT test_id FROM tests WHERE course_id = ?
+      )`, [courseId]);
+
+      await pool.query(`DELETE FROM test_attempts WHERE test_id IN (
+        SELECT test_id FROM tests WHERE course_id = ?
+      )`, [courseId]);
+
+      await pool.query(`DELETE FROM questions WHERE test_id IN (
+        SELECT test_id FROM tests WHERE course_id = ?
+      )`, [courseId]);
+
+      await pool.query(`DELETE FROM tests WHERE course_id = ?`, [courseId]);
+      await pool.query(`DELETE FROM training_course_assignments WHERE course_id = ?`, [courseId]);
+      await pool.query(`DELETE FROM training_courses WHERE course_id = ?`, [courseId]);
+
+      res.json({ success: true });
+    } catch (err) {
+      console.error("Delete course error:", err);
+      res.status(500).json({ message: "Server error" });
+    }
+  }
+);
+
+
+app.delete(
+  "/api/placement-training/tests/:testId",
+  authenticateToken,
+  authorize(["trainer", "HOD", "Principal"]),
+  async (req, res) => {
+    try {
+      const { testId } = req.params;
+
+      // Order matters
+      await pool.query(`DELETE FROM test_attempts WHERE test_id = ?`, [testId]);
+      await pool.query(`DELETE FROM training_test_assignments WHERE test_id = ?`, [testId]);
+      await pool.query(`DELETE FROM questions WHERE test_id = ?`, [testId]);
+      await pool.query(`DELETE FROM tests WHERE test_id = ?`, [testId]);
+
+      res.json({ success: true });
+    } catch (err) {
+      console.error("Delete test error:", err);
+      res.status(500).json({ message: "Server error" });
+    }
+  }
+);
+
+
+app.patch(
+  "/api/placement-training/tests/:testId/details",
+  authenticateToken,
+  authorize(["trainer", "HOD", "Principal"]),
+  async (req, res) => {
+    try {
+      const { testId } = req.params;
+      const {
+        title,
+        duration_minutes,
+        total_marks,
+        pass_mark,
+        max_attempts
+      } = req.body;
+
+      if (!title || !duration_minutes) {
+        return res.status(400).json({ message: "Invalid data" });
+      }
+
+      await pool.query(
+        `
+        UPDATE tests
+        SET title = ?, duration_minutes = ?, total_marks = ?, pass_mark = ?, max_attempts = ?
+        WHERE test_id = ?
+        `,
+        [title, duration_minutes, total_marks, pass_mark, max_attempts, testId]
+      );
+
+      res.json({ success: true });
+    } catch (err) {
+      console.error("Update test error:", err);
+      res.status(500).json({ message: "Server error" });
+    }
+  }
+);
+
+
+
 app.get(
   "/api/placement-training/courses/:courseId/assignments",
   authenticateToken,
@@ -4368,6 +4456,67 @@ app.get(
     }
   }
 );
+
+
+
+app.patch(
+  "/api/placement-training/tests/:testId",
+  authenticateToken,
+  authorize(["trainer", "HOD", "Principal"]),
+  async (req, res) => {
+    try {
+      const { testId } = req.params;
+      const { published, publish_start, publish_end } = req.body;
+
+      const fields = [];
+      const values = [];
+
+      // published flag
+      if (published !== undefined) {
+        fields.push("published = ?");
+        values.push(published);
+      }
+
+      // publish_start (DO NOT reformat or reparse)
+      if (publish_start !== undefined) {
+        fields.push("publish_start = ?");
+        values.push(publish_start);
+      }
+
+      // publish_end (DO NOT reformat or reparse)
+      if (publish_end !== undefined) {
+        fields.push("publish_end = ?");
+        values.push(publish_end);
+      }
+
+      if (!fields.length) {
+        return res.status(400).json({ message: "No fields to update" });
+      }
+
+      values.push(testId);
+
+      const [result] = await pool.query(
+        `UPDATE tests SET ${fields.join(", ")} WHERE test_id = ?`,
+        values
+      );
+
+      // IMPORTANT: check if update really happened
+      if (result.affectedRows === 0) {
+        return res
+          .status(404)
+          .json({ message: "Test not found or no changes applied" });
+      }
+
+      res.json({ success: true });
+    } catch (err) {
+      console.error("PATCH TEST ERROR:", err);
+      res.status(500).json({ message: "Server error" });
+    }
+  }
+);
+
+
+
 
 app.get(
   "/api/placement-training/tests/:testId/assignments",
@@ -4519,18 +4668,31 @@ app.post(
       const { courseId } = req.params;
       const { assignments } = req.body;
 
-      if (!Array.isArray(assignments) || assignments.length === 0) {
-        return res.status(400).json({ message: "Assignments required" });
+      if (!Array.isArray(assignments)) {
+        return res.status(400).json({ message: "Invalid assignments data" });
       }
 
-      for (const a of assignments) {
+      // 1️⃣ Remove all existing assignments for this course
+      await pool.query(
+        `DELETE FROM training_course_assignments WHERE course_id = ?`,
+        [courseId]
+      );
+
+      // 2️⃣ Insert new assignments (if any)
+      if (assignments.length > 0) {
+        const values = assignments.map(a => [
+          courseId,
+          a.dept_id,
+          a.class_id
+        ]);
+
         await pool.query(
           `
-          INSERT IGNORE INTO training_course_assignments
+          INSERT INTO training_course_assignments
             (course_id, dept_id, class_id)
-          VALUES (?, ?, ?)
+          VALUES ?
           `,
-          [courseId, a.dept_id, a.class_id]
+          [values]
         );
       }
 
@@ -4544,6 +4706,7 @@ app.post(
     }
   }
 );
+
 
 
 app.get(
@@ -4668,24 +4831,32 @@ app.get(
         [rollNo]
       );
 
+      if (!student) {
+        return res.status(404).json({ message: "Student not found" });
+      }
+
       const [tests] = await pool.query(
         `
   SELECT
     t.test_id,
     t.title,
+    t.course_id,
     t.duration_minutes,
     t.publish_start,
-    t.publish_end
+    t.publish_end,
+    t.total_marks,
+    t.pass_mark,
+    t.max_attempts
   FROM tests t
-  JOIN training_course_assignments tca
-    ON tca.course_id = t.course_id
+  JOIN training_test_assignments tta
+    ON tta.test_id = t.test_id
   WHERE
     t.course_id = ?
+    AND tta.dept_id = ?
+    AND tta.class_id = ?
     AND t.published = 1
     AND NOW() BETWEEN t.publish_start AND t.publish_end
-    AND tca.dept_id = ?
-    AND tca.class_id = ?
-  ORDER BY t.publish_start ASC
+  ORDER BY t.publish_start ASC;
   `,
         [courseId, student.dept_id, student.class_id]
       );
@@ -4700,13 +4871,15 @@ app.get(
 );
 
 
+
 app.patch(
   "/api/placement-training/tests/:testId/publish-window",
   authenticateToken,
   authorize(["trainer", "HOD", "Principal"]),
   async (req, res) => {
     const { testId } = req.params;
-    const { publish_start, publish_end } = req.body;
+    const publish_start = null;
+    const publish_end = null;
 
     await pool.query(
       `
@@ -4718,6 +4891,91 @@ app.patch(
     );
 
     res.json({ success: true });
+  }
+);
+
+app.get(
+  "/api/placement-training/tests/:testId/attempts",
+  authenticateToken,
+  authorize(["trainer", "HOD", "student", "CA", "Principal"]),
+  async (req, res) => {
+    try {
+      const { testId } = req.params;
+
+      const [rows] = await pool.query(
+        `
+        SELECT
+          s.student_id,
+          s.roll_no,
+          s.name,
+          COUNT(ta.attempt_id) AS total_attempts,
+          MAX(ta.attempt_no)   AS latest_attempt,
+          MAX(ta.submitted_at) AS last_submitted_at
+        FROM test_attempts ta
+        JOIN students s ON s.student_id = ta.student_id
+        WHERE ta.test_id = ?
+        GROUP BY s.student_id
+        ORDER BY total_attempts DESC
+        `,
+        [testId]
+      );
+
+      res.json({
+        success: true,
+        students: rows,
+        total_students_attempted: rows.length
+      });
+
+    } catch (err) {
+      console.error("Fetch test attempts error:", err);
+      res.status(500).json({ message: "Server error" });
+    }
+  }
+);
+
+
+app.get(
+  "/api/placement-training/student/tests/:testId/status",
+  authenticateToken,
+  authorize(["student"]),
+  async (req, res) => {
+    try {
+      const { testId } = req.params;
+      const rollNo = req.user.roll_no;
+
+      const [[student]] = await pool.query(
+        "SELECT dept_id, class_id FROM students WHERE roll_no = ?",
+        [rollNo]
+      );
+
+      if (!student) {
+        return res.status(404).json({ is_live: false });
+      }
+
+      const [[test]] = await pool.query(
+        `
+        SELECT 1
+        FROM tests t
+        JOIN training_test_assignments ta
+          ON ta.test_id = t.test_id
+        WHERE
+          t.test_id = ?
+          AND t.published = 1
+          AND NOW() BETWEEN t.publish_start AND t.publish_end
+          AND ta.dept_id = ?
+          AND ta.class_id = ?
+        `,
+        [testId, student.dept_id, student.class_id]
+      );
+
+      res.json({
+        is_live: !!test
+      });
+
+    } catch (err) {
+      console.error("Test status check error:", err);
+      res.status(500).json({ is_live: false });
+    }
   }
 );
 
