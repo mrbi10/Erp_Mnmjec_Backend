@@ -3871,7 +3871,7 @@ app.get(
   authenticateToken,
   async (req, res) => {
     try {
-      const { role, class_id, dept_id, user_id } = req.user;
+      const { role, assigned_class_id, dept_id, user_id } = req.user;
 
       let filter = "WHERE a.status = 'SUBMITTED'";
       const params = [];
@@ -3883,7 +3883,7 @@ app.get(
 
       else if (role === "CA") {
         filter += " AND s.class_id = ?";
-        params.push(class_id);
+        params.push(assigned_class_id);
       }
 
       else if (role === "HOD") {
@@ -3964,42 +3964,90 @@ app.get(
   }
 );
 
-
 app.get(
   "/api/placement-training/results",
   authenticateToken,
   async (req, res) => {
     try {
-      const { role, student_id, class_id, dept_id, user_id } = req.user;
+
+      const { role, assigned_class_id, id } = req.user;
+
+      let email = null;
+      let studentId = null;
+      let classId = null;
+      let deptId = null;
+
+      if (role === "student" ) {
+
+        const [userRows] = await pool.query(
+          `
+          SELECT email
+          FROM users
+          WHERE user_id = ?
+          `,
+          [id]
+        );
+
+
+        if (userRows.length === 0) {
+          console.log("❌ No user found for user_id:", id);
+          return res.status(404).json({ message: "User not found" });
+        }
+
+        email = userRows[0].email;
+      }
+
+
+      if (role === "student" ) {
+
+        const [studentRows] = await pool.query(
+          `
+          SELECT student_id, class_id, dept_id
+          FROM students
+          WHERE email = ?
+          `,
+          [email]
+        );
+
+
+        if (studentRows.length === 0) {
+          return res
+            .status(404)
+            .json({ message: "Student record not found" });
+        }
+
+        studentId = studentRows[0].student_id;
+        classId = studentRows[0].class_id;
+        deptId = studentRows[0].dept_id;
+      }
 
       let where = "WHERE a.status = 'SUBMITTED'";
       const params = [];
 
       if (role === "student") {
         where += " AND a.student_id = ?";
-        params.push(student_id);
+        params.push(studentId);
       }
 
       else if (role === "trainer") {
-        where += " AND c.trainer_id = ?";
-        params.push(user_id);
       }
 
       else if (role === "CA") {
         where += " AND s.class_id = ?";
-        params.push(class_id);
+        params.push(assigned_class_id);
       }
 
       else if (role === "HOD") {
         where += " AND s.dept_id = ?";
-        params.push(dept_id);
+        params.push(deptId);
       }
 
-      const [results] = await pool.query(
-        `
+
+      const finalQuery = `
         SELECT
-          c.name           AS course_name,
-          t.title          AS test_title,
+          c.name AS course_name,
+          t.title AS test_title,
+          s.name AS student_name,
           s.roll_no,
           a.attempt_no,
           a.score,
@@ -4012,19 +4060,20 @@ app.get(
         JOIN students s ON s.student_id = a.student_id
         ${where}
         ORDER BY a.submitted_at DESC
-        `,
-        params
-      );
+      `;
+
+
+      const [results] = await pool.query(finalQuery, params);
+
+
 
       res.json({ results });
 
     } catch (err) {
-      console.error("Results API error:", err);
       res.status(500).json({ message: "Server error" });
     }
   }
 );
-
 
 
 app.get(
@@ -4248,7 +4297,7 @@ app.post(
   async (req, res) => {
     try {
       const { testId } = req.params;
-      const { assignments, publish_start, publish_end , published} = req.body;
+      const { assignments, publish_start, publish_end, published } = req.body;
 
       if (!assignments || assignments.length === 0) {
         return res.status(400).json({ message: "Assignments required" });
