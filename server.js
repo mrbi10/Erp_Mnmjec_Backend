@@ -33,6 +33,8 @@ const pool = mysql.createPool({
 });
 
 
+
+
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -2445,15 +2447,27 @@ app.post("/api/lateentry", authenticateToken, async (req, res) => {
     if (!roll_no) {
       return res.status(400).json({ message: "Roll number required" });
     }
+    // 1. Get the current time in IST
+    const now = new Date();
+    const formatter = new Intl.DateTimeFormat('en-US', {
+      timeZone: 'Asia/Kolkata',
+      hour: 'numeric',
+      minute: 'numeric',
+      hour12: false,
+    });
 
-    const currentTime = new Date();
-    const currentHour = currentTime.getHours();
-    const currentMinutes = currentTime.getMinutes();
+    // 2. Extract hour and minute as numbers
+    const parts = formatter.formatToParts(now);
+    const currentHour = parseInt(parts.find(p => p.type === 'hour').value);
+    const currentMinutes = parseInt(parts.find(p => p.type === 'minute').value);
 
-    // Only allow late marking after 9:00 AM
-    if (currentHour < 9 || (currentHour === 9 && currentMinutes < 0)) {
+    console.log(`Current IST Time: ${currentHour}:${currentMinutes}`);
+
+    // 3. Only allow late marking after 9:00 AM
+    if (currentHour < 9) {
       return res.status(400).json({ message: "Late marking allowed only after 9:00 AM" });
     }
+
 
     // Find student
     const [students] = await pool.query(
@@ -3977,7 +3991,7 @@ app.get(
       let classId = null;
       let deptId = null;
 
-      if (role === "student" ) {
+      if (role === "student") {
 
         const [userRows] = await pool.query(
           `
@@ -3998,7 +4012,7 @@ app.get(
       }
 
 
-      if (role === "student" ) {
+      if (role === "student") {
 
         const [studentRows] = await pool.query(
           `
