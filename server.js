@@ -22,31 +22,31 @@ const groq = new Groq({
 // =======================
 // MySQL Connection Pool
 // =======================
-// const pool = mysql.createPool({
-//   host: process.env.DB_HOST || 'localhost',
-//   user: process.env.DB_USER || 'root',
-//   password: process.env.DB_PASSWORD || '',
-//   database: process.env.DB_NAME || 'mnmjec_erp',
-//   waitForConnections: true,
-//   connectionLimit: 10,
-//   queueLimit: 0
-// });
-
 const pool = mysql.createPool({
-  host: process.env.DB_HOST,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME,
-  port: process.env.DB_PORT || 3306,
-
+  host: process.env.DB_HOST || 'localhost',
+  user: process.env.DB_USER || 'root',
+  password: process.env.DB_PASSWORD || '',
+  database: process.env.DB_NAME || 'mnmjec_erp',
   waitForConnections: true,
   connectionLimit: 10,
-  queueLimit: 0,
-
-  ssl: {
-    rejectUnauthorized: true
-  }
+  queueLimit: 0
 });
+
+// const pool = mysql.createPool({
+//   host: process.env.DB_HOST,
+//   user: process.env.DB_USER,
+//   password: process.env.DB_PASSWORD,
+//   database: process.env.DB_NAME,
+//   port: process.env.DB_PORT || 3306,
+
+//   waitForConnections: true,
+//   connectionLimit: 10,
+//   queueLimit: 0,
+
+//   ssl: {
+//     rejectUnauthorized: true
+//   }
+// });
 
 
 
@@ -3640,6 +3640,7 @@ app.patch(
         option_c,
         option_d,
         correct_option,
+        note,
         marks
       } = req.body;
 
@@ -3653,6 +3654,7 @@ app.patch(
           option_c = ?,
           option_d = ?,
           correct_option = ?,
+          note = ?,
           marks = ?
         WHERE question_id = ?
         `,
@@ -3663,6 +3665,7 @@ app.patch(
           option_c,
           option_d,
           correct_option,
+          note,
           marks,
           questionId
         ]
@@ -3678,8 +3681,100 @@ app.patch(
 );
 
 
+app.delete(
+  "/api/placement-training/questions/:questionId",
+  authenticateToken,
+  authorize(["Staff", "CA", "trainer", "HOD", "Principal"]),
+  async (req, res) => {
+    try {
+      const { questionId } = req.params;
+
+      const [[row]] = await pool.query(
+        `
+        SELECT q.test_id, t.published
+        FROM questions q
+        JOIN tests t ON t.test_id = q.test_id
+        WHERE q.question_id = ?
+        `,
+        [questionId]
+      );
+
+      if (!row) {
+        return res.status(404).json({ message: "Question not found" });
+      }
+
+      if (row.published === 1) {
+        return res.status(400).json({
+          message: "Cannot delete questions after test is published"
+        });
+      }
+
+      const testId = row.test_id;
+
+      await pool.query(
+        `DELETE FROM questions WHERE question_id = ?`,
+        [questionId]
+      );
+
+      const [[sum]] = await pool.query(
+        `
+        SELECT COALESCE(SUM(marks), 0) AS totalMarks
+        FROM questions
+        WHERE test_id = ?
+        `,
+        [testId]
+      );
+
+      await pool.query(
+        `
+        UPDATE tests
+        SET total_marks = ?
+        WHERE test_id = ?
+        `,
+        [sum.totalMarks, testId]
+      );
+
+      res.json({
+        success: true,
+        total_marks: sum.totalMarks
+      });
+
+    } catch (err) {
+      console.error("Delete question error:", err);
+      res.status(500).json({ message: "Server error" });
+    }
+  }
+);
 
 
+app.get(
+  "/api/placement-training/tests/:testId/meta",
+  authenticateToken,
+  authorize(["Staff", "CA", "trainer", "HOD", "Principal"]),
+  async (req, res) => {
+    try {
+      const { testId } = req.params;
+
+      const [[test]] = await pool.query(
+        `
+        SELECT test_id, course_id, title, duration_minutes, total_marks, pass_mark, max_attempts, publish_start, publish_end, published
+        FROM tests
+        WHERE test_id = ?
+        `,
+        [testId]
+      );
+
+      if (!test) {
+        return res.status(404).json({ message: "Test not found" });
+      }
+
+      res.json({ test });
+    } catch (err) {
+      console.error("Fetch test meta error:", err);
+      res.status(500).json({ message: "Server error" });
+    }
+  }
+);
 
 
 
@@ -3701,7 +3796,8 @@ app.get(
           option_c,
           option_d,
           correct_option,
-          marks
+          marks,
+          note
         FROM questions
         WHERE test_id = ?
         ORDER BY question_id
@@ -3791,7 +3887,8 @@ app.post(
           option_b,
           option_c,
           option_d,
-          marks
+          marks,
+          note
         FROM questions
         WHERE test_id = ?
         `,
@@ -3864,8 +3961,14 @@ app.post(
         [testId]
       );
 
-      const percentage = (totalScore / test.total_marks) * 100;
-      const passStatus = totalScore >= test.pass_mark ? "pass" : "fail";
+      const percentage =
+        test.total_marks > 0
+          ? (totalScore / test.total_marks) * 100
+          : 0;
+
+      const passStatus =
+        percentage >= test.pass_mark ? "pass" : "fail";
+
 
       await conn.query(
         `
@@ -4272,8 +4375,6 @@ app.post(
   }
 );
 
-
-
 app.post(
   "/api/placement-training/tests/:testId/questions",
   authenticateToken,
@@ -4291,8 +4392,8 @@ app.post(
         await pool.query(
           `
           INSERT INTO questions
-            (test_id, question, option_a, option_b, option_c, option_d, correct_option, marks)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (test_id, question, option_a, option_b, option_c, option_d, correct_option, note, marks)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
           `,
           [
             testId,
@@ -4302,14 +4403,34 @@ app.post(
             q.option_c,
             q.option_d,
             q.correct_option,
+            q.note || null,
             q.marks || 1
           ]
         );
       }
 
+      const [[sum]] = await pool.query(
+        `
+        SELECT COALESCE(SUM(marks), 0) AS totalMarks
+        FROM questions
+        WHERE test_id = ?
+        `,
+        [testId]
+      );
+
+      await pool.query(
+        `
+        UPDATE tests
+        SET total_marks = ?
+        WHERE test_id = ?
+        `,
+        [sum.totalMarks, testId]
+      );
+
       res.json({
         success: true,
-        added: questions.length
+        added: questions.length,
+        total_marks: sum.totalMarks
       });
 
     } catch (err) {
@@ -4318,6 +4439,7 @@ app.post(
     }
   }
 );
+
 
 app.post(
   "/api/placement-training/tests/:testId/assign",
@@ -4360,7 +4482,6 @@ app.post(
         [values]
       );
 
-      // ✅ 3️⃣ SAVE PUBLISH WINDOW INTO tests TABLE (THIS WAS MISSING)
       await pool.query(
         `
         UPDATE tests
