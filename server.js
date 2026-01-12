@@ -22,31 +22,31 @@ const groq = new Groq({
 // =======================
 // MySQL Connection Pool
 // =======================
-// const pool = mysql.createPool({
-//   host: process.env.DB_HOST || 'localhost',
-//   user: process.env.DB_USER || 'root',
-//   password: process.env.DB_PASSWORD || '',
-//   database: process.env.DB_NAME || 'mnmjec_erp',
-//   waitForConnections: true,
-//   connectionLimit: 10,
-//   queueLimit: 0
-// });
-
 const pool = mysql.createPool({
-  host: process.env.DB_HOST,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME,
-  port: process.env.DB_PORT || 3306,
-
+  host: process.env.DB_HOST || 'localhost',
+  user: process.env.DB_USER || 'root',
+  password: process.env.DB_PASSWORD || '',
+  database: process.env.DB_NAME || 'mnmjec_erp',
   waitForConnections: true,
   connectionLimit: 10,
-  queueLimit: 0,
-
-  ssl: {
-    rejectUnauthorized: true
-  }
+  queueLimit: 0
 });
+
+// const pool = mysql.createPool({
+//   host: process.env.DB_HOST,
+//   user: process.env.DB_USER,
+//   password: process.env.DB_PASSWORD,
+//   database: process.env.DB_NAME,
+//   port: process.env.DB_PORT || 3306,
+
+//   waitForConnections: true,
+//   connectionLimit: 10,
+//   queueLimit: 0,
+
+//   ssl: {
+//     rejectUnauthorized: true
+//   }
+// });
 
 
 
@@ -3870,11 +3870,19 @@ app.post(
 
       const [result] = await pool.query(
         `
-        INSERT INTO test_attempts
-          (test_id, student_id, attempt_no, started_at)
-        VALUES (?, ?, ?, NOW())
+       INSERT INTO test_attempts (
+  test_id,
+  student_id,
+  started_at,
+  status,
+  ip_address,
+  user_agent,
+  device_fingerprint
+)
+VALUES (?, ?, NOW(), 'in_progress', ?, ?, ?)
+
         `,
-        [testId, student.student_id, attemptCount.total + 1]
+        [testId, student.student_id, req.ip, req.get('User-Agent'), req.get('Device-Fingerprint')]
       );
 
       // Fetch questions (send without correct answers)
@@ -3970,14 +3978,31 @@ app.post(
         percentage >= test.pass_mark ? "pass" : "fail";
 
 
+      const answeredCount = answers.length;
+      const status = req.body.forced_submission ? "auto_submitted" : "submitted";
+
       await conn.query(
         `
-        UPDATE test_attempts
-        SET score = ?, percentage = ?, pass_status = ?, submitted_at = NOW(),status = 'SUBMITTED'
-        WHERE attempt_id = ?
-        `,
-        [totalScore, percentage, passStatus, attempt_id]
+UPDATE test_attempts
+SET
+  submitted_at = NOW(),
+  status = ?,
+  forced_submission = ?,
+  answered_count = ?,
+  score = ?,
+  pass_status = ?
+WHERE attempt_id = ?
+`,
+        [
+          status,
+          req.body.forced_submission ? 1 : 0,
+          answeredCount,
+          totalScore,
+          passStatus,
+          attempt_id
+        ]
       );
+
 
       await conn.commit();
 
@@ -4005,7 +4030,7 @@ app.get(
     try {
       const { role, assigned_class_id, dept_id, user_id } = req.user;
 
-      let filter = "WHERE a.status = 'SUBMITTED'";
+      let filter = "WHERE a.status IN ('submitted','auto_submitted')";
       const params = [];
 
       if (role === "trainer") {
@@ -4153,7 +4178,7 @@ app.get(
         deptId = studentRows[0].dept_id;
       }
 
-      let where = "WHERE a.status = 'SUBMITTED'";
+      let where = "WHERE a.status IN ('submitted','auto_submitted')";
       const params = [];
 
       if (role === "student") {
@@ -4831,7 +4856,10 @@ app.get(
           COUNT(DISTINCT ta.student_id) AS attempted,
           SUM(ta.pass_status = 'pass') AS passed,
           SUM(ta.pass_status = 'fail') AS failed,
-          ROUND(AVG(ta.percentage), 2) AS avg_percentage
+          ROUND(
+  SUM(ta.score) / SUM(t.total_marks) * 100,
+  2
+) AS avg_percentage
         FROM training_course_assignments ca
         JOIN students s
           ON s.dept_id = ca.dept_id
@@ -5177,6 +5205,115 @@ app.get(
     }
   }
 );
+
+const gTTS = require("gtts");
+
+
+app.post("/speak", (req, res) => {
+  try {
+    const { text } = req.body;
+
+    if (!text || !text.trim()) {
+      return res.status(400).json({ message: "Text is required" });
+    }
+
+    // Tamil language
+    const tts = new gTTS(text, "ta");
+
+    res.set({
+      "Content-Type": "audio/mpeg",
+      "Content-Disposition": "inline; filename=tamil.mp3",
+    });
+
+    const stream = tts.stream();
+
+    stream.on("error", (err) => {
+      console.error("gTTS stream error:", err);
+      if (!res.headersSent) {
+        res.status(502).json({ message: "TTS failed" });
+      }
+    });
+
+    stream.pipe(res);
+  } catch (err) {
+    console.error("Server error:", err);
+    res.status(500).json({ message: "Internal error" });
+  }
+});
+
+
+
+app.post("/ask-kili", async (req, res) => {
+  const { name, age } = req.body;
+
+  if (!name || !age) {
+    return res.status(400).json({ reply: "தகவல் போதவில்லை." });
+  }
+
+  try {
+    const groqRes = await fetch(
+      "https://api.groq.com/openai/v1/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
+        },
+        body: JSON.stringify({
+          model: "moonshotai/kimi-k2-instruct-0905",
+          temperature: 0.65,
+          max_tokens: 600,
+          frequency_penalty: 0.9,
+          presence_penalty: 0.7,
+          messages: [
+            {
+              role: "system",
+              content: `
+நீ ஒரு உயிருள்ள பச்சைக் கிலி.
+கோயில் மாடத்தில் உட்கார்ந்து கிலி ஜோதிடம் சொல்லும் கிலி நீ.
+
+மிக முக்கியம்:
+ஒரு ஆங்கில வார்த்தையும் பயன்படுத்தக்கூடாது.
+
+விதிகள்:
+- வயது 17–25: மாணவன் / மாணவி
+- வயது 25க்கு மேல்: ஆசிரியர் / பணியாளர்
+- அனைவரும் “மிஸ்ரிமல் நவஜீ முனோத் ஜெயின் பொறியியல் கல்லூரி”யைச் சேர்ந்தவர்கள்
+
+பேசும் முறை:
+- பேசுவது போல
+- சிரிப்பு, லைட்டா கிண்டல்
+- எதிர்காலம், வாழ்க்கை பற்றி
+- 5 முதல் 8 வரிகள்
+- ஒவ்வொரு வரியும் வேறுபட்டதாக
+
+மொழி:
+- முழுக்க முழுக்க தமிழ் மட்டும்
+              `,
+            },
+            {
+              role: "user",
+              content: `பெயர்: ${name}\nவயது: ${age}`,
+            },
+          ],
+        }),
+      }
+    );
+
+    const data = await groqRes.json();
+
+    const reply =
+      data?.choices?.[0]?.message?.content ||
+      "கிலி இப்போது அமைதியாக இருக்கிறது…";
+
+    res.json({ reply });
+  } catch (err) {
+    console.error("Groq error:", err);
+    res.status(500).json({
+      reply: "கிலிக்கு இப்போது ஓய்வு தேவை. பின்னர் வாருங்கள்.",
+    });
+  }
+});
 
 
 // =======================
