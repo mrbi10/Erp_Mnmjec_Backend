@@ -29,7 +29,8 @@ const pool = mysql.createPool({
   database: process.env.DB_NAME || 'mnmjec_erp',
   waitForConnections: true,
   connectionLimit: 10,
-  queueLimit: 0
+  queueLimit: 0,
+  timezone: 'Z'
 });
 
 // const pool = mysql.createPool({
@@ -48,6 +49,102 @@ const pool = mysql.createPool({
 //   }
 // });
 
+const submitAttemptInternal = async (attemptId) => {
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [[attempt]] = await conn.query(
+      `
+      SELECT test_id
+      FROM test_attempts
+      WHERE attempt_id = ?
+      `,
+      [attemptId]
+    );
+
+    if (!attempt) return;
+
+    const testId = attempt.test_id;
+
+    const [rows] = await conn.query(
+      `
+      SELECT
+        q.correct_option,
+        q.marks,
+        sa.selected_option
+      FROM questions q
+      LEFT JOIN student_answers sa
+        ON sa.question_id = q.question_id
+       AND sa.attempt_id = ?
+      WHERE q.test_id = ?
+      `,
+      [attemptId, testId]
+    );
+
+    let score = 0;
+    let answered = 0;
+
+    for (const r of rows) {
+      if (r.selected_option) {
+        answered++;
+        if (r.selected_option === r.correct_option) {
+          score += r.marks;
+        }
+      }
+    }
+
+    const [[test]] = await conn.query(
+      `SELECT pass_mark, total_marks FROM tests WHERE test_id = ?`,
+      [testId]
+    );
+
+    const percentage =
+      test.total_marks > 0 ? (score / test.total_marks) * 100 : 0;
+
+    const passStatus =
+      percentage >= test.pass_mark ? "pass" : "fail";
+
+    await conn.query(
+      `
+      UPDATE test_attempts
+      SET
+        submitted_at = NOW(),
+        status = 'auto_submitted',
+        forced_submission = 1,
+        answered_count = ?,
+        score = ?,
+        pass_status = ?
+      WHERE attempt_id = ?
+        AND status = 'terminated'
+      `,
+      [answered, score, passStatus, attemptId]
+    );
+
+    await conn.commit();
+  } catch (err) {
+    await conn.rollback();
+    console.error("Internal submit error:", err);
+  } finally {
+    conn.release();
+  }
+};
+
+
+const terminateAttempt = async (attemptId, reason) => {
+  await pool.query(
+    `
+    UPDATE test_attempts
+    SET
+      status = 'terminated',
+      forced_submission = 1,
+      termination_reason = ?
+    WHERE attempt_id = ?
+      AND status = 'in_progress'
+    `,
+    [reason, attemptId]
+  );
+};
 
 
 const authenticateToken = (req, res, next) => {
@@ -3582,21 +3679,32 @@ app.get(
 
       const [rows] = await pool.query(
         `
-        SELECT
-          test_id,
-          title,
-          duration_minutes,
-          total_marks,
-          pass_mark,
-          max_attempts,
-          publish_start,
-          publish_end,
-          published,
-          created_at
-        FROM tests
-        WHERE course_id = ?
-        ORDER BY created_at DESC
-        `,
+       SELECT
+  t.test_id,
+  t.title,
+  t.duration_minutes,
+  t.total_marks,
+  t.pass_mark,
+  t.max_attempts,
+  t.publish_start,
+  t.publish_end,
+  t.published,
+  t.created_at,
+  CASE
+    WHEN t.published = 1
+     AND UTC_TIMESTAMP() BETWEEN t.publish_start AND t.publish_end
+    THEN 'LIVE'
+
+    WHEN t.published = 1
+     AND UTC_TIMESTAMP() < t.publish_start
+    THEN 'SCHEDULED'
+
+    ELSE 'IDLE'
+  END AS status
+FROM tests t
+WHERE t.course_id = ?
+ORDER BY t.created_at DESC
+ `,
         [courseId]
       );
 
@@ -3817,211 +3925,6 @@ app.get(
   }
 );
 
-
-app.post(
-  "/api/placement-training/student/tests/:testId/start",
-  authenticateToken,
-  authorize(["student"]),
-  async (req, res) => {
-    try {
-      const { testId } = req.params;
-      const rollNo = req.user.roll_no;
-
-      const [[student]] = await pool.query(
-        "SELECT student_id, dept_id, class_id FROM students WHERE roll_no = ?",
-        [rollNo]
-      );
-
-
-      const [[test]] = await pool.query(
-        `
-  SELECT t.max_attempts, t.duration_minutes
-  FROM tests t
-  JOIN training_courses tc ON t.course_id = tc.course_id
-  JOIN training_course_assignments tca
-    ON tca.course_id = tc.course_id
-  WHERE
-    t.test_id = ?
-    AND t.published = 1
-    AND NOW() BETWEEN t.publish_start AND t.publish_end
-    AND tca.dept_id = ?
-    AND tca.class_id = ?
-  `,
-        [testId, student.dept_id, student.class_id]
-      );
-
-
-      if (!test) {
-        return res.status(404).json({ message: "Test not available" });
-      }
-
-      const [[attemptCount]] = await pool.query(
-        `
-        SELECT COUNT(*) AS total
-        FROM test_attempts
-        WHERE test_id = ? AND student_id = ?
-        `,
-        [testId, student.student_id]
-      );
-
-      if (attemptCount.total >= test.max_attempts) {
-        return res.status(400).json({ message: "Max attempts reached" });
-      }
-
-      const [result] = await pool.query(
-        `
-       INSERT INTO test_attempts (
-  test_id,
-  student_id,
-  started_at,
-  status,
-  ip_address,
-  user_agent,
-  device_fingerprint
-)
-VALUES (?, ?, NOW(), 'in_progress', ?, ?, ?)
-
-        `,
-        [testId, student.student_id, req.ip, req.get('User-Agent'), req.get('Device-Fingerprint')]
-      );
-
-      // Fetch questions (send without correct answers)
-      const [questions] = await pool.query(
-        `
-        SELECT 
-          question_id,
-          question,
-          option_a,
-          option_b,
-          option_c,
-          option_d,
-          marks,
-          note
-        FROM questions
-        WHERE test_id = ?
-        `,
-        [testId]
-      );
-
-      res.json({
-        success: true,
-        test,
-        attempt_id: result.insertId,
-        questions
-      });
-
-    } catch (err) {
-      console.error("Start test error:", err);
-      res.status(500).json({ message: "Server error" });
-    }
-  }
-);
-
-
-app.post(
-  "/api/placement-training/student/tests/:testId/submit",
-  authenticateToken,
-  authorize(["student"]),
-  async (req, res) => {
-    const { testId } = req.params;
-    const { attempt_id, answers } = req.body;
-
-    if (!attempt_id || !Array.isArray(answers)) {
-      return res.status(400).json({ message: "Invalid payload" });
-    }
-
-    let conn;
-    try {
-      conn = await pool.getConnection();
-      await conn.beginTransaction();
-
-      let totalScore = 0;
-
-      for (const ans of answers) {
-        const { question_id, selected_option } = ans;
-
-        const [[q]] = await conn.query(
-          `
-          SELECT correct_option, marks
-          FROM questions
-          WHERE question_id = ? AND test_id = ?
-          `,
-          [question_id, testId]
-        );
-
-        if (!q) continue;
-
-        const isCorrect = q.correct_option === selected_option;
-        if (isCorrect) totalScore += q.marks;
-
-        await conn.query(
-          `
-          INSERT INTO student_answers
-            (attempt_id, question_id, selected_option, is_correct)
-          VALUES (?, ?, ?, ?)
-          `,
-          [attempt_id, question_id, selected_option, isCorrect ? 1 : 0]
-        );
-      }
-
-      const [[test]] = await conn.query(
-        "SELECT pass_mark, total_marks FROM tests WHERE test_id = ?",
-        [testId]
-      );
-
-      const percentage =
-        test.total_marks > 0
-          ? (totalScore / test.total_marks) * 100
-          : 0;
-
-      const passStatus =
-        percentage >= test.pass_mark ? "pass" : "fail";
-
-
-      const answeredCount = answers.length;
-      const status = req.body.forced_submission ? "auto_submitted" : "submitted";
-
-      await conn.query(
-        `
-UPDATE test_attempts
-SET
-  submitted_at = NOW(),
-  status = ?,
-  forced_submission = ?,
-  answered_count = ?,
-  score = ?,
-  pass_status = ?
-WHERE attempt_id = ?
-`,
-        [
-          status,
-          req.body.forced_submission ? 1 : 0,
-          answeredCount,
-          totalScore,
-          passStatus,
-          attempt_id
-        ]
-      );
-
-
-      await conn.commit();
-
-      res.json({
-        success: true,
-        score: totalScore,
-        percentage,
-        pass_status: passStatus
-      });
-
-    } catch (err) {
-      if (conn) await conn.rollback();
-      console.error("Submit test error:", err);
-      res.status(500).json({ message: "Server error" });
-    } finally {
-      if (conn) conn.release();
-    }
-  }
-);
 
 app.get(
   "/api/placement-training/analytics",
@@ -4252,7 +4155,7 @@ app.get(
         SELECT 
           tc.name AS course_name,
           t.title AS test_title,
-          ta.attempt_no,
+          ta.attempt_id,
           ta.score,
           ta.percentage,
           ta.pass_status,
@@ -4815,7 +4718,7 @@ app.get(
         SELECT 
           s.roll_no,
           s.name,
-          ta.attempt_no,
+          ta.attempt_id,
           ta.score,
           ta.percentage,
           ta.pass_status,
@@ -5082,7 +4985,7 @@ app.get(
     AND tta.dept_id = ?
     AND tta.class_id = ?
     AND t.published = 1
-    AND NOW() BETWEEN t.publish_start AND t.publish_end
+    AND UTC_TIMESTAMP() BETWEEN t.publish_start AND t.publish_end
   ORDER BY t.publish_start ASC;
   `,
         [courseId, student.dept_id, student.class_id]
@@ -5136,7 +5039,7 @@ app.get(
           s.roll_no,
           s.name,
           COUNT(ta.attempt_id) AS total_attempts,
-          MAX(ta.attempt_no)   AS latest_attempt,
+          MAX(ta.attempt_id)   AS latest_attempt,
           MAX(ta.submitted_at) AS last_submitted_at
         FROM test_attempts ta
         JOIN students s ON s.student_id = ta.student_id
@@ -5188,7 +5091,7 @@ app.get(
         WHERE
           t.test_id = ?
           AND t.published = 1
-          AND NOW() BETWEEN t.publish_start AND t.publish_end
+          AND UTC_TIMESTAMP() BETWEEN t.publish_start AND t.publish_end
           AND ta.dept_id = ?
           AND ta.class_id = ?
         `,
@@ -5240,8 +5143,6 @@ app.post("/speak", (req, res) => {
     res.status(500).json({ message: "Internal error" });
   }
 });
-
-
 
 
 app.post("/ask-kili", async (req, res) => {
@@ -5321,6 +5222,394 @@ app.post("/ask-kili", async (req, res) => {
     });
   }
 });
+
+
+app.post(
+  "/api/placement-training/student/tests/log-violation",
+  authenticateToken,
+  authorize(["student"]),
+  async (req, res) => {
+    try {
+      const {
+        attempt_id,
+        violation_type,
+        violation_source = null,
+        extra_payload = null
+      } = req.body;
+
+      if (!attempt_id || !violation_type) {
+        return res.status(400).json({ message: "Invalid payload" });
+      }
+
+      // 🔒 Validate attempt ownership & state
+      const [[attempt]] = await pool.query(
+        `
+       SELECT attempt_id, status
+FROM test_attempts
+WHERE attempt_id = ?
+  AND student_id = ?
+  AND status IN ('in_progress', 'terminated')
+
+        `,
+        [attempt_id, req.user.student_id]
+      );
+
+      if (!attempt) {
+        return res.status(403).json({ message: "Invalid or closed attempt" });
+      }
+
+      // 📊 Count existing warnings
+      const [[count]] = await pool.query(
+        `
+        SELECT COUNT(*) AS total
+        FROM test_attempt_violations
+        WHERE attempt_id = ?
+        `,
+        [attempt_id]
+      );
+
+      const warningNumber = count.total + 1;
+      const isTerminal = warningNumber >= 2 ? 1 : 0;
+
+      // 📝 Log violation
+      await pool.query(
+        `
+        INSERT INTO test_attempt_violations
+        (
+          attempt_id,
+          violation_type,
+          violation_source,
+          warning_number,
+          is_terminal,
+          event_timestamp,
+          extra_payload
+        )
+        VALUES (?, ?, ?, ?, ?, NOW(), ?)
+        `,
+        [
+          attempt_id,
+          violation_type,
+          violation_source,
+          warningNumber,
+          isTerminal,
+          extra_payload ? JSON.stringify(extra_payload) : null
+        ]
+      );
+
+      if (attempt.status === 'terminated') {
+        return res.json({
+          success: true,
+          warning_number: warningNumber,
+          terminated: true
+        });
+      }
+
+
+      // 🚨 TERMINATE ON 2nd VIOLATION
+      if (isTerminal) {
+        await terminateAttempt(attempt_id, violation_type);
+
+        // Auto-submit (DB truth)
+        await submitAttemptInternal(attempt_id);
+      }
+
+      res.json({
+        success: true,
+        warning_number: warningNumber,
+        terminated: !!isTerminal
+      });
+    } catch (err) {
+      console.error("Violation log error:", err);
+      res.status(500).json({ message: "Server error" });
+    }
+  }
+);
+
+
+app.post(
+  "/api/placement-training/student/tests/:testId/answer",
+  authenticateToken,
+  authorize(["student"]),
+  async (req, res) => {
+    try {
+      const { testId } = req.params;
+      const { attempt_id, question_id, selected_option } = req.body;
+
+      if (!attempt_id || !question_id || !selected_option) {
+        return res.status(400).json({ message: "Invalid payload" });
+      }
+
+      const [[valid]] = await pool.query(
+        `
+        SELECT ta.attempt_id
+        FROM test_attempts ta
+        JOIN questions q ON q.question_id = ?
+        WHERE
+          ta.attempt_id = ?
+          AND ta.student_id = ?
+          AND ta.status = 'in_progress'
+          AND ta.test_id = ?
+          AND q.test_id = ta.test_id
+        `,
+        [question_id, attempt_id, req.user.student_id, testId]
+      );
+
+      if (!valid) {
+        return res.json({ success: true });
+      }
+
+
+      await pool.query(
+        `
+        INSERT INTO student_answers (attempt_id, question_id, selected_option)
+        VALUES (?, ?, ?)
+        ON DUPLICATE KEY UPDATE
+          selected_option = VALUES(selected_option),
+          updated_at = CURRENT_TIMESTAMP
+        `,
+        [attempt_id, question_id, selected_option]
+      );
+
+      await pool.query(
+        `
+        UPDATE test_attempts
+        SET answered_count = (
+          SELECT COUNT(*) FROM student_answers WHERE attempt_id = ?
+        )
+        WHERE attempt_id = ?
+        `,
+        [attempt_id, attempt_id]
+      );
+
+      res.json({ success: true });
+    } catch (err) {
+      console.error("Save answer error:", err);
+      res.status(500).json({ message: "Server error" });
+    }
+  }
+);
+
+app.post(
+  "/api/placement-training/student/tests/:testId/submit",
+  authenticateToken,
+  authorize(["student"]),
+  async (req, res) => {
+    const { testId } = req.params;
+    const { attempt_id, forced_submission = 0 } = req.body;
+
+    let conn;
+    try {
+      conn = await pool.getConnection();
+      await conn.beginTransaction();
+
+      const [[attempt]] = await conn.query(
+        `
+        SELECT attempt_id, status
+FROM test_attempts
+WHERE attempt_id = ?
+  AND student_id = ?
+
+        `,
+
+        [attempt_id, req.user.student_id]
+      );
+      if (!attempt) {
+        await conn.rollback();
+        return res.status(403).json({
+          message: "Invalid or already closed attempt"
+        });
+      }
+
+      if (attempt.status !== 'in_progress') {
+        await conn.rollback();
+        return res.json({
+          success: true,
+          message: "Already submitted"
+        });
+      }
+
+      const [rows] = await conn.query(
+        `
+        SELECT
+          q.question_id,
+          q.correct_option,
+          q.marks,
+          sa.selected_option
+        FROM questions q
+        LEFT JOIN student_answers sa
+          ON sa.question_id = q.question_id
+         AND sa.attempt_id = ?
+        WHERE q.test_id = ?
+        `,
+        [attempt_id, testId]
+      );
+
+      let totalScore = 0;
+      let answeredCount = 0;
+
+      for (const r of rows) {
+        if (r.selected_option) {
+          answeredCount++;
+          if (r.selected_option === r.correct_option) {
+            totalScore += r.marks;
+          }
+        }
+      }
+
+      const [[test]] = await conn.query(
+        `SELECT pass_mark, total_marks FROM tests WHERE test_id = ?`,
+        [testId]
+      );
+
+      const percentage =
+        test.total_marks > 0
+          ? (totalScore / test.total_marks) * 100
+          : 0;
+
+      const passStatus =
+        percentage >= test.pass_mark ? "pass" : "fail";
+
+      await conn.query(
+        `
+        UPDATE test_attempts
+        SET
+          submitted_at = NOW(),
+          status = ?,
+          forced_submission = ?,
+          answered_count = ?,
+          score = ?,
+          pass_status = ?
+        WHERE attempt_id = ?
+          AND status = 'in_progress'
+        `,
+        [
+          forced_submission ? "auto_submitted" : "submitted",
+          forced_submission ? 1 : 0,
+          answeredCount,
+          totalScore,
+          passStatus,
+          attempt_id
+        ]
+      );
+
+      await conn.commit();
+
+      res.json({
+        success: true,
+        score: totalScore,
+        percentage,
+        pass_status: passStatus
+      });
+    } catch (err) {
+      if (conn) await conn.rollback();
+      console.error("Submit test error:", err);
+      res.status(500).json({ message: "Server error" });
+    } finally {
+      if (conn) conn.release();
+    }
+  }
+);
+
+
+app.post(
+  "/api/placement-training/student/tests/:testId/start",
+  authenticateToken,
+  authorize(["student"]),
+  async (req, res) => {
+    try {
+      const { testId } = req.params;
+      const rollNo = req.user.roll_no;
+
+      const [[student]] = await pool.query(
+        "SELECT student_id, dept_id, class_id FROM students WHERE roll_no = ?",
+        [rollNo]
+      );
+
+
+      const [[test]] = await pool.query(
+        `
+  SELECT t.max_attempts, t.duration_minutes
+  FROM tests t
+  JOIN training_courses tc ON t.course_id = tc.course_id
+  JOIN training_course_assignments tca
+    ON tca.course_id = tc.course_id
+  WHERE
+    t.test_id = ?
+    AND t.published = 1
+    AND UTC_TIMESTAMP() BETWEEN t.publish_start AND t.publish_end
+    AND tca.dept_id = ?
+    AND tca.class_id = ?
+  `,
+        [testId, student.dept_id, student.class_id]
+      );
+
+
+      if (!test) {
+        return res.status(404).json({ message: "Test not available" });
+      }
+
+      const [[attemptCount]] = await pool.query(
+        `
+        SELECT COUNT(*) AS total
+        FROM test_attempts
+        WHERE test_id = ? AND student_id = ?
+        `,
+        [testId, student.student_id]
+      );
+
+      if (attemptCount.total >= test.max_attempts) {
+        return res.status(400).json({ message: "Max attempts reached" });
+      }
+
+      const [result] = await pool.query(
+        `
+       INSERT INTO test_attempts (
+  test_id,
+  student_id,
+  started_at,
+  status,
+  ip_address,
+  user_agent,
+  device_fingerprint
+)
+VALUES (?, ?, NOW(), 'in_progress', ?, ?, ?)
+
+        `,
+        [testId, student.student_id, req.ip, req.get('User-Agent'), req.get('Device-Fingerprint')]
+      );
+
+      // Fetch questions (send without correct answers)
+      const [questions] = await pool.query(
+        `
+        SELECT 
+          question_id,
+          question,
+          option_a,
+          option_b,
+          option_c,
+          option_d,
+          marks,
+          note
+        FROM questions
+        WHERE test_id = ?
+        `,
+        [testId]
+      );
+
+      res.json({
+        success: true,
+        test,
+        attempt_id: result.insertId,
+        questions
+      });
+
+    } catch (err) {
+      console.error("Start test error:", err);
+      res.status(500).json({ message: "Server error" });
+    }
+  }
+);
+
 
 
 // =======================
