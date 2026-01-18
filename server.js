@@ -5051,7 +5051,7 @@ app.get(
           s.roll_no,
           s.name,
           COUNT(ta.attempt_id) AS total_attempts,
-          MAX(ta.attempt_id)   AS latest_attempt,
+          COUNT(ta.attempt_id)   AS latest_attempt,
           MAX(ta.submitted_at) AS last_submitted_at
         FROM test_attempts ta
         JOIN students s ON s.student_id = ta.student_id
