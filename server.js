@@ -23,33 +23,33 @@ const groq = new Groq({
 // =======================
 // MySQL Connection Pool
 // =======================
-const pool = mysql.createPool({
-  host: process.env.DB_HOST || 'localhost',
-  user: process.env.DB_USER || 'root',
-  password: process.env.DB_PASSWORD || '',
-  database: process.env.DB_NAME || 'mnmjec_erp',
-  waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0,
-  timezone: 'Z'
-});
-
 // const pool = mysql.createPool({
-//   host: process.env.DB_HOST,
-//   user: process.env.DB_USER,
-//   password: process.env.DB_PASSWORD,
-//   database: process.env.DB_NAME,
-//   port: process.env.DB_PORT || 3306,
-
+//   host: process.env.DB_HOST || 'localhost',
+//   user: process.env.DB_USER || 'root',
+//   password: process.env.DB_PASSWORD || '',
+//   database: process.env.DB_NAME || 'mnmjec_erp',
 //   waitForConnections: true,
 //   connectionLimit: 10,
 //   queueLimit: 0,
-//   timezone: 'Z',
-
-//   ssl: {
-//     rejectUnauthorized: true
-//   }
+//   timezone: 'Z'
 // });
+
+const pool = mysql.createPool({
+  host: process.env.DB_HOST,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME,
+  port: process.env.DB_PORT || 3306,
+
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0,
+  timezone: 'Z',
+
+  ssl: {
+    rejectUnauthorized: true
+  }
+});
 
 const submitAttemptInternal = async (attemptId) => {
   const conn = await pool.getConnection();
