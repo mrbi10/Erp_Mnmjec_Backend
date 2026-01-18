@@ -14,6 +14,7 @@ const upload = multer();
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.set("trust proxy", true);
 const Groq = require("groq-sdk");
 const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY,
@@ -22,33 +23,33 @@ const groq = new Groq({
 // =======================
 // MySQL Connection Pool
 // =======================
-// const pool = mysql.createPool({
-//   host: process.env.DB_HOST || 'localhost',
-//   user: process.env.DB_USER || 'root',
-//   password: process.env.DB_PASSWORD || '',
-//   database: process.env.DB_NAME || 'mnmjec_erp',
-//   waitForConnections: true,
-//   connectionLimit: 10,
-//   queueLimit: 0,
-//   timezone: 'Z'
-// });
-
 const pool = mysql.createPool({
-  host: process.env.DB_HOST,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME,
-  port: process.env.DB_PORT || 3306,
-
+  host: process.env.DB_HOST || 'localhost',
+  user: process.env.DB_USER || 'root',
+  password: process.env.DB_PASSWORD || '',
+  database: process.env.DB_NAME || 'mnmjec_erp',
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0,
-  timezone: 'Z',
-
-  ssl: {
-    rejectUnauthorized: true
-  }
+  timezone: 'Z'
 });
+
+// const pool = mysql.createPool({
+//   host: process.env.DB_HOST,
+//   user: process.env.DB_USER,
+//   password: process.env.DB_PASSWORD,
+//   database: process.env.DB_NAME,
+//   port: process.env.DB_PORT || 3306,
+
+//   waitForConnections: true,
+//   connectionLimit: 10,
+//   queueLimit: 0,
+//   timezone: 'Z',
+
+//   ssl: {
+//     rejectUnauthorized: true
+//   }
+// });
 
 const submitAttemptInternal = async (attemptId) => {
   const conn = await pool.getConnection();
@@ -169,6 +170,16 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
+async function getStudentIdFromToken(req) {
+  if (!req.user?.roll_no) return null;
+
+  const [[student]] = await pool.query(
+    "SELECT student_id FROM students WHERE roll_no = ?",
+    [req.user.roll_no]
+  );
+
+  return student ? student.student_id : null;
+}
 
 
 // =======================
@@ -5242,18 +5253,22 @@ app.post(
         return res.status(400).json({ message: "Invalid payload" });
       }
 
-      // 🔒 Validate attempt ownership & state
+      const studentId = await getStudentIdFromToken(req);
+      if (!studentId) {
+        return res.status(403).json({ message: "Student record not found" });
+      }
+
       const [[attempt]] = await pool.query(
         `
-       SELECT attempt_id, status
-FROM test_attempts
-WHERE attempt_id = ?
-  AND student_id = ?
-  AND status IN ('in_progress', 'terminated')
-
-        `,
-        [attempt_id, req.user.student_id]
+  SELECT attempt_id, status
+  FROM test_attempts
+  WHERE attempt_id = ?
+    AND student_id = ?
+    AND status IN ('in_progress', 'terminated')
+  `,
+        [attempt_id, studentId]
       );
+
 
       if (!attempt) {
         return res.status(403).json({ message: "Invalid or closed attempt" });
@@ -5335,6 +5350,8 @@ app.post(
     try {
       const { testId } = req.params;
       const { attempt_id, question_id, selected_option } = req.body;
+      const studentId = await getStudentIdFromToken(req);
+      if (!studentId) return res.json({ success: true });
 
       if (!attempt_id || !question_id || !selected_option) {
         return res.status(400).json({ message: "Invalid payload" });
@@ -5352,7 +5369,7 @@ app.post(
           AND ta.test_id = ?
           AND q.test_id = ta.test_id
         `,
-        [question_id, attempt_id, req.user.student_id, testId]
+        [question_id, attempt_id, studentId, testId]
       );
 
       if (!valid) {
@@ -5398,10 +5415,16 @@ app.post(
     const { testId } = req.params;
     const { attempt_id, forced_submission = 0 } = req.body;
 
+    const studentId = await getStudentIdFromToken(req);
+    if (!studentId) {
+      return res.status(403).json({ message: "Student record not found" });
+    }
+
     let conn;
     try {
       conn = await pool.getConnection();
       await conn.beginTransaction();
+
 
       const [[attempt]] = await conn.query(
         `
@@ -5412,7 +5435,7 @@ WHERE attempt_id = ?
 
         `,
 
-        [attempt_id, req.user.student_id]
+        [attempt_id, studentId]
       );
       if (!attempt) {
         await conn.rollback();
@@ -5520,6 +5543,10 @@ app.post(
     try {
       const { testId } = req.params;
       const rollNo = req.user.roll_no;
+      const ipAddress =
+        req.headers["x-forwarded-for"]?.split(",")[0]?.trim() ||
+        req.socket.remoteAddress;
+
 
       const [[student]] = await pool.query(
         "SELECT student_id, dept_id, class_id FROM students WHERE roll_no = ?",
@@ -5529,7 +5556,13 @@ app.post(
 
       const [[test]] = await pool.query(
         `
-  SELECT t.max_attempts, t.duration_minutes
+  SELECT
+    t.max_attempts,
+    t.duration_minutes,
+    LEAST(
+      TIMESTAMPDIFF(SECOND, UTC_TIMESTAMP(), t.publish_end),
+      t.duration_minutes * 60
+    ) AS remaining_seconds
   FROM tests t
   JOIN training_courses tc ON t.course_id = tc.course_id
   JOIN training_course_assignments tca
@@ -5544,9 +5577,12 @@ app.post(
         [testId, student.dept_id, student.class_id]
       );
 
-
       if (!test) {
         return res.status(404).json({ message: "Test not available" });
+      }
+
+      if (test.remaining_seconds <= 0) {
+        return res.status(400).json({ message: "Test time already ended" });
       }
 
       const [[attemptCount]] = await pool.query(
@@ -5576,8 +5612,20 @@ app.post(
 VALUES (?, ?, NOW(), 'in_progress', ?, ?, ?)
 
         `,
-        [testId, student.student_id, req.ip, req.get('User-Agent'), req.get('Device-Fingerprint')]
+        [testId, student.student_id, ipAddress, req.get('User-Agent'), req.get('Device-Fingerprint')]
       );
+
+      await pool.query(
+        `
+  UPDATE test_attempts
+  SET total_questions = (
+    SELECT COUNT(*) FROM questions WHERE test_id = ?
+  )
+  WHERE attempt_id = ?
+  `,
+        [testId, result.insertId]
+      );
+
 
       // Fetch questions (send without correct answers)
       const [questions] = await pool.query(
@@ -5599,9 +5647,9 @@ VALUES (?, ?, NOW(), 'in_progress', ?, ?, ?)
 
       res.json({
         success: true,
-        test,
         attempt_id: result.insertId,
-        questions
+        questions,
+        remaining_seconds: test.remaining_seconds
       });
 
     } catch (err) {
