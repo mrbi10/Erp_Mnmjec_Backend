@@ -23,33 +23,33 @@ const groq = new Groq({
 // =======================
 // MySQL Connection Pool
 // =======================
-// const pool = mysql.createPool({
-//   host: process.env.DB_HOST || 'localhost',
-//   user: process.env.DB_USER || 'root',
-//   password: process.env.DB_PASSWORD || '',
-//   database: process.env.DB_NAME || 'mnmjec_erp',
-//   waitForConnections: true,
-//   connectionLimit: 10,
-//   queueLimit: 0,
-//   timezone: 'Z'
-// });
-
 const pool = mysql.createPool({
-  host: process.env.DB_HOST,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME,
-  port: process.env.DB_PORT || 3306,
-
+  host: process.env.DB_HOST || 'localhost',
+  user: process.env.DB_USER || 'root',
+  password: process.env.DB_PASSWORD || '',
+  database: process.env.DB_NAME || 'mnmjec_erp',
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0,
-  timezone: 'Z',
-
-  ssl: {
-    rejectUnauthorized: true
-  }
+  timezone: 'Z'
 });
+
+// const pool = mysql.createPool({
+//   host: process.env.DB_HOST,
+//   user: process.env.DB_USER,
+//   password: process.env.DB_PASSWORD,
+//   database: process.env.DB_NAME,
+//   port: process.env.DB_PORT || 3306,
+
+//   waitForConnections: true,
+//   connectionLimit: 10,
+//   queueLimit: 0,
+//   timezone: 'Z',
+
+//   ssl: {
+//     rejectUnauthorized: true
+//   }
+// });
 
 const submitAttemptInternal = async (attemptId) => {
   const conn = await pool.getConnection();
@@ -4041,91 +4041,53 @@ app.get(
   authenticateToken,
   async (req, res) => {
     try {
+      const { role, assigned_class_id, dept_id, id } = req.user;
 
-      const { role, assigned_class_id, id } = req.user;
-
-      let email = null;
       let studentId = null;
-      let classId = null;
-      let deptId = null;
 
+      // Student must NOT use this endpoint
       if (role === "student") {
-
-        const [userRows] = await pool.query(
-          `
-          SELECT email
-          FROM users
-          WHERE user_id = ?
-          `,
-          [id]
-        );
-
-
-        if (userRows.length === 0) {
-          console.log("❌ No user found for user_id:", id);
-          return res.status(404).json({ message: "User not found" });
-        }
-
-        email = userRows[0].email;
-      }
-
-
-      if (role === "student") {
-
-        const [studentRows] = await pool.query(
-          `
-          SELECT student_id, class_id, dept_id
-          FROM students
-          WHERE email = ?
-          `,
-          [email]
-        );
-
-
-        if (studentRows.length === 0) {
-          return res
-            .status(404)
-            .json({ message: "Student record not found" });
-        }
-
-        studentId = studentRows[0].student_id;
-        classId = studentRows[0].class_id;
-        deptId = studentRows[0].dept_id;
+        return res.status(403).json({ message: "Forbidden" });
       }
 
       let where = "WHERE a.status IN ('submitted','auto_submitted')";
       const params = [];
 
-      if (role === "student") {
-        where += " AND a.student_id = ?";
-        params.push(studentId);
-      }
-
-      else if (role === "trainer") {
-      }
-
-      else if (role === "CA") {
+      if (role === "CA") {
         where += " AND s.class_id = ?";
         params.push(assigned_class_id);
       }
 
-      else if (role === "HOD") {
+      if (role === "HOD") {
         where += " AND s.dept_id = ?";
-        params.push(deptId);
+        params.push(dept_id);
       }
 
-
-      const finalQuery = `
+      const query = `
         SELECT
           c.name AS course_name,
           t.title AS test_title,
+          t.test_id,
+          t.total_marks,
+          t.pass_mark,
+
+          s.student_id,
           s.name AS student_name,
           s.roll_no,
-          a.attempt_no,
+          s.dept_id,
+          s.class_id,
+
+          a.attempt_id,
+          ROW_NUMBER() OVER (
+            PARTITION BY a.student_id, a.test_id
+            ORDER BY a.started_at
+          ) AS attempt_no,
+
           a.score,
-          a.percentage,
+          ROUND((a.score / t.total_marks) * 100, 2) AS percentage,
           a.pass_status,
           a.submitted_at
+
         FROM test_attempts a
         JOIN tests t ON t.test_id = a.test_id
         JOIN training_courses c ON c.course_id = t.course_id
@@ -4134,14 +4096,11 @@ app.get(
         ORDER BY a.submitted_at DESC
       `;
 
-
-      const [results] = await pool.query(finalQuery, params);
-
-
-
+      const [results] = await pool.query(query, params);
       res.json({ results });
 
     } catch (err) {
+      console.error(err);
       res.status(500).json({ message: "Server error" });
     }
   }
@@ -4154,37 +4113,58 @@ app.get(
   authorize(["student"]),
   async (req, res) => {
     try {
-      const rollNo = req.user.roll_no;
+      const { id } = req.user;
+
+      const [[user]] = await pool.query(
+        "SELECT email FROM users WHERE user_id = ?",
+        [id]
+      );
+
+      if (!user) {
+        return res.status(404).json({ message: "User not found" });
+      }
 
       const [[student]] = await pool.query(
-        "SELECT student_id, dept_id, class_id FROM students WHERE roll_no = ?",
-        [rollNo]
+        "SELECT student_id FROM students WHERE email = ?",
+        [user.email]
       );
 
+      if (!student) {
+        return res.status(400).json({
+          message: "Student mapping missing. Contact admin.",
+        });
+      }
 
-      const [rows] = await pool.query(
-        `
-        SELECT 
-          tc.name AS course_name,
+      const query = `
+        SELECT
+          c.name AS course_name,
           t.title AS test_title,
-          ta.attempt_id,
-          ta.score,
-          ta.percentage,
-          ta.pass_status,
-          ta.submitted_at
-        FROM test_attempts ta
-        JOIN tests t ON ta.test_id = t.test_id
-        JOIN training_courses tc ON t.course_id = tc.course_id
-        WHERE ta.student_id = ?
-        ORDER BY ta.submitted_at DESC
-        `,
-        [student.student_id]
-      );
+          t.test_id,
+          t.total_marks,
+          t.pass_mark,
 
-      res.json({
-        success: true,
-        results: rows
-      });
+          a.attempt_id,
+          ROW_NUMBER() OVER (
+            PARTITION BY a.student_id, a.test_id
+            ORDER BY a.started_at
+          ) AS attempt_no,
+
+          a.score,
+          ROUND((a.score / t.total_marks) * 100, 2) AS percentage,
+          a.pass_status,
+          a.submitted_at
+
+        FROM test_attempts a
+        JOIN tests t ON t.test_id = a.test_id
+        JOIN training_courses c ON c.course_id = t.course_id
+        WHERE a.student_id = ?
+          AND a.status IN ('submitted','auto_submitted')
+        ORDER BY a.submitted_at DESC
+      `;
+
+      const [results] = await pool.query(query, [student.student_id]);
+
+      res.json({ results });
 
     } catch (err) {
       console.error("Student results error:", err);
@@ -4192,6 +4172,7 @@ app.get(
     }
   }
 );
+
 
 
 // ===== Placement Training – Trainer =====
@@ -5543,6 +5524,7 @@ app.post(
     try {
       const { testId } = req.params;
       const rollNo = req.user.roll_no;
+      const deviceFingerprint = req.get("Device-Fingerprint") || null;
       const ipAddress =
         req.headers["x-forwarded-for"]?.split(",")[0]?.trim() ||
         req.socket.remoteAddress;
@@ -5552,6 +5534,21 @@ app.post(
         "SELECT student_id, dept_id, class_id FROM students WHERE roll_no = ?",
         [rollNo]
       );
+
+      if (!student) {
+        return res.status(404).json({
+          message: "Student mapping not found",
+        });
+      }
+
+      const userAgent = req.headers["user-agent"] || "";
+
+      if (/android|iphone|ipad|mobile/i.test(userAgent)) {
+        return res.status(403).json({
+          message: "Exams must be taken on a desktop or laptop",
+        });
+      }
+
 
 
       const [[test]] = await pool.query(
@@ -5598,6 +5595,25 @@ app.post(
         return res.status(400).json({ message: "Max attempts reached" });
       }
 
+      const [[activeAttempt]] = await pool.query(
+        `
+  SELECT attempt_id
+  FROM test_attempts
+  WHERE test_id = ?
+    AND student_id = ?
+    AND status = 'in_progress'
+  LIMIT 1
+  `,
+        [testId, student.student_id]
+      );
+
+      if (activeAttempt) {
+        return res.status(400).json({
+          message: "You already have an active attempt for this test",
+        });
+      }
+
+
       const [result] = await pool.query(
         `
        INSERT INTO test_attempts (
@@ -5612,7 +5628,7 @@ app.post(
 VALUES (?, ?, NOW(), 'in_progress', ?, ?, ?)
 
         `,
-        [testId, student.student_id, ipAddress, req.get('User-Agent'), req.get('Device-Fingerprint')]
+        [testId, student.student_id, ipAddress, req.get('User-Agent'), deviceFingerprint]
       );
 
       await pool.query(
